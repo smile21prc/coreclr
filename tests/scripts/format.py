@@ -84,13 +84,13 @@ def main(argv):
 
     print("Downloading .Net CLI")
     if platform == 'Linux':
-        dotnetcliUrl = "https://go.microsoft.com/fwlink/?LinkID=809129"
+        dotnetcliUrl = "https://go.microsoft.com/fwlink/?linkid=839628"
         dotnetcliFilename = os.path.join(dotnetcliPath, 'dotnetcli-jitutils.tar.gz')
     elif platform == 'OSX':
-        dotnetcliUrl = "https://go.microsoft.com/fwlink/?LinkID=809128"
+        dotnetcliUrl = "https://go.microsoft.com/fwlink/?linkid=839641"
         dotnetcliFilename = os.path.join(dotnetcliPath, 'dotnetcli-jitutils.tar.gz')
     elif platform == 'Windows_NT':
-        dotnetcliUrl = "https://go.microsoft.com/fwlink/?LinkID=809126"
+        dotnetcliUrl = "https://go.microsoft.com/fwlink/?linkid=839634"
         dotnetcliFilename = os.path.join(dotnetcliPath, 'dotnetcli-jitutils.zip')
     else:
         print('Unknown os ', os)
@@ -160,7 +160,7 @@ def main(argv):
 
     # Run bootstrap
 
-    my_env["PATH"] += os.pathsep + dotnetcliPath
+    my_env["PATH"] = dotnetcliPath + os.pathsep + my_env["PATH"]
     if platform == 'Linux' or platform == 'OSX':
         print("Running bootstrap")
         proc = subprocess.Popen(['bash', bootstrapPath], env=my_env)
@@ -173,7 +173,7 @@ def main(argv):
 
     returncode = 0
     jitutilsBin = os.path.join(coreclr, "jitutils", "bin")
-    my_env["PATH"] += os.pathsep + jitutilsBin
+    my_env["PATH"] = jitutilsBin + os.pathsep + my_env["PATH"]
     current_dir = os.getcwd()
 
     if not os.path.isdir(jitutilsBin):
@@ -185,7 +185,7 @@ def main(argv):
     if platform == 'Linux' or platform == 'OSX':
         jitformat = os.path.join(jitformat, "jit-format")
     elif platform == 'Windows_NT':
-        jitformat = os.path.join(jitformat,"jit-format.cmd")
+        jitformat = os.path.join(jitformat,"jit-format.bat")
     errorMessage = ""
 
     builds = ["Checked", "Debug", "Release"]
@@ -202,7 +202,25 @@ def main(argv):
                 errorMessage += " -c <absolute-path-to-coreclr> --verbose --fix --projects " + project +"\n"
                 returncode = errorcode
 
+                # Fix mode doesn't return an error, so we have to run the build, then run with
+                # --fix to generate the patch. This means that it is likely only the first run
+                # of jit-format will return a formatting failure.
+                if errorcode == -2:
+                    # If errorcode was -2, no need to run clang-tidy again
+                    proc = subprocess.Popen([jitformat, "--fix", "--untidy", "-a", arch, "-b", build, "-o", platform, "-c", coreclr, "--verbose", "--projects", project], env=my_env)
+                    output,error = proc.communicate()
+                else:
+                    # Otherwise, must run both
+                    proc = subprocess.Popen([jitformat, "--fix", "-a", arch, "-b", build, "-o", platform, "-c", coreclr, "--verbose", "--projects", project], env=my_env)
+                    output,error = proc.communicate()
+
     os.chdir(current_dir)
+
+    if returncode != 0:
+        # Create a patch file
+        patchFile = open("format.patch", "w")
+        proc = subprocess.Popen(["git", "diff", "--patch", "-U20"], env=my_env, stdout=patchFile)
+        output,error = proc.communicate()
 
     if os.path.isdir(jitUtilsPath):
         print("Deleting " + jitUtilsPath)
@@ -217,8 +235,12 @@ def main(argv):
         os.remove(bootstrapPath)
 
     if returncode != 0:
+        buildUrl = my_env["BUILD_URL"]
         print("There were errors in formatting. Please run jit-format locally with: \n")
         print(errorMessage)
+        print("\nOr download and apply generated patch:")
+        print("wget " + buildUrl + "artifact/format.patch")
+        print("git apply format.patch")
 
     return returncode
 

@@ -518,6 +518,5 @@
         <ExcludeList Include="$(XunitTestBinBase)\JIT\Regression\JitBlue\DevDiv_255294\DevDiv_255294\DevDiv_255294.cmd">
             <Issue>times out</Issue>
         </ExcludeList>
- 
     </ItemGroup>
 </Project>

@@ -744,7 +744,7 @@ void MethodContext::recCompileMethod(CORINFO_METHOD_INFO *info, unsigned flags)
 void MethodContext::dmpCompileMethod(DWORD key, const Agnostic_CompileMethod& value)
 {
     printf("CompiledMethod key %u, value ftn-%016llX scp-%016llX ilo-%u ils-%u ms-%u ehc-%u opt-%u rk-%u "
-             "args{cc-%u rc-%016llX rts-%016llX rt-%u(%s) flg-%08X nA-%u cc-%u ci-%u mc-%u mi-%u arg-%016llX cb-%u pSig-%u scp-%016llX tok-%08X} "
+           "args{cc-%u rc-%016llX rts-%016llX rt-%u(%s) flg-%08X nA-%u cc-%u ci-%u mc-%u mi-%u arg-%016llX cb-%u pSig-%u scp-%016llX tok-%08X} "
            "locals{cc-%u rc-%016llX rts-%016llX rt-%u(%s) flg-%08X nA-%u cc-%u ci-%u mc-%u mi-%u arg-%016llX cb-%u pSig-%u scp-%016llX tok-%08X} "
            "flg-%08X",
         key,
@@ -1098,8 +1098,8 @@ void MethodContext::recGetJitFlags(CORJIT_FLAGS *jitFlags, DWORD sizeInBytes, DW
 }
 void MethodContext::dmpGetJitFlags(DWORD key, DD value)
 {
-    CORJIT_FLAGS *flags = (CORJIT_FLAGS*)GetJitFlags->GetBuffer(value.A);
-    printf("GetJitFlags key %u sizeInBytes-%u corJitFlags-%08X corJitFlags2-%08X", key, value.B, flags->corJitFlags, flags->corJitFlags2);
+    CORJIT_FLAGS *jitflags = (CORJIT_FLAGS*)GetJitFlags->GetBuffer(value.A);
+    printf("GetJitFlags key %u sizeInBytes-%u jitFlags-%016llX", key, value.B, jitflags->GetFlagsRaw());
     GetJitFlags->Unlock();
 }
 DWORD MethodContext::repGetJitFlags(CORJIT_FLAGS *jitFlags, DWORD sizeInBytes)
@@ -2842,6 +2842,34 @@ CORINFO_CLASS_HANDLE MethodContext::repGetArgClass(CORINFO_SIG_INFO* sig, CORINF
     return (CORINFO_CLASS_HANDLE)value.result;
 }
 
+void MethodContext::recGetHFAType(CORINFO_CLASS_HANDLE clsHnd, CorInfoType result)
+{
+    if (GetHFAType == nullptr)
+        GetHFAType = new LightWeightMap<DWORDLONG, DWORD>();
+
+    GetHFAType->Add((DWORDLONG)clsHnd, (DWORD)result);
+    DEBUG_REC(dmpGetHFAType((DWORDLONG)clsHnd, (DWORD)result));
+    return;
+}
+
+void MethodContext::dmpGetHFAType(DWORDLONG key, DWORD value)
+{
+    printf("GetHFAType key %016llX, value %u ", key, value);
+    return;
+}
+
+CorInfoType MethodContext::repGetHFAType(CORINFO_CLASS_HANDLE clsHnd)
+{
+    DWORD value;
+
+    AssertCodeMsg(GetHFAType != nullptr, EXCEPTIONCODE_MC, "Didn't find anything for %016llX", (DWORDLONG)clsHnd);
+    AssertCodeMsg(GetHFAType->GetIndex((DWORDLONG)clsHnd) != -1, EXCEPTIONCODE_MC, "Didn't find %016llX", (DWORDLONG)clsHnd);
+
+    value = GetHFAType->Get((DWORDLONG)clsHnd);
+    DEBUG_REP(dmpGetHFAType((DWORDLONG)clsHnd, value));
+    return (CorInfoType)value;
+}
+
 void MethodContext::recGetMethodInfo(CORINFO_METHOD_HANDLE ftn, CORINFO_METHOD_INFO *info, bool result, DWORD exceptionCode)
 {
     if (GetMethodInfo == nullptr)
@@ -3266,6 +3294,47 @@ void MethodContext::repGetMethodVTableOffset(CORINFO_METHOD_HANDLE method, unsig
     *offsetOfIndirection = (unsigned)value.A;
     *offsetAfterIndirection = (unsigned)value.B;
     DEBUG_REP(dmpGetMethodVTableOffset((DWORDLONG)method, value));
+}
+
+void MethodContext::recResolveVirtualMethod(CORINFO_METHOD_HANDLE virtMethod, CORINFO_CLASS_HANDLE implClass,
+    CORINFO_CONTEXT_HANDLE ownerType, CORINFO_METHOD_HANDLE result)
+{
+    if (ResolveVirtualMethod == nullptr)
+    {
+        ResolveVirtualMethod = new LightWeightMap<Agnostic_ResolveVirtualMethod, DWORDLONG>();
+    }
+
+    Agnostic_ResolveVirtualMethod key;
+    key.virtualMethod = (DWORDLONG)virtMethod;
+    key.implementingClass = (DWORDLONG)implClass;
+    key.ownerType = (DWORDLONG)ownerType;
+    ResolveVirtualMethod->Add(key, (DWORDLONG) result);
+    DEBUG_REC(dmpResolveVirtualMethod(key, result));
+}
+
+void MethodContext::dmpResolveVirtualMethod(const Agnostic_ResolveVirtualMethod& key, DWORDLONG value)
+{
+    printf("ResolveVirtualMethod virtMethod-%016llX, implClass-%016llX, ownerType--%01611X, result-%016llX",
+        key.virtualMethod, key.implementingClass, key.ownerType, value);
+}
+
+CORINFO_METHOD_HANDLE MethodContext::repResolveVirtualMethod(CORINFO_METHOD_HANDLE virtMethod, CORINFO_CLASS_HANDLE implClass,
+    CORINFO_CONTEXT_HANDLE ownerType)
+{
+    Agnostic_ResolveVirtualMethod key;
+    key.virtualMethod = (DWORDLONG)virtMethod;
+    key.implementingClass = (DWORDLONG)implClass;
+    key.ownerType = (DWORDLONG)ownerType;
+
+    AssertCodeMsg(ResolveVirtualMethod != nullptr, EXCEPTIONCODE_MC, "No ResolveVirtualMap map for %016llX-%016llX-%016llX",
+        key.virtualMethod, key.implementingClass, key.ownerType);
+    AssertCodeMsg(ResolveVirtualMethod->GetIndex(key) != -1, EXCEPTIONCODE_MC, "Didn't find %016llX-%016llx-%016llX",
+        key.virtualMethod, key.implementingClass, key.ownerType);
+    DWORDLONG result = ResolveVirtualMethod->Get(key);
+
+    DEBUG_REP(dmpResolveVirtualMethod(key, result));
+
+    return (CORINFO_METHOD_HANDLE)result;
 }
 
 void MethodContext::recGetTokenTypeAsHandle(CORINFO_RESOLVED_TOKEN * pResolvedToken, CORINFO_CLASS_HANDLE result)
@@ -4163,9 +4232,6 @@ void MethodContext::repGetEEInfo(CORINFO_EE_INFO *pEEInfoOut)
         pEEInfoOut->osMajor = (unsigned)0;
         pEEInfoOut->osMinor = (unsigned)0;
         pEEInfoOut->osBuild = (unsigned)0;
-#ifdef DEBUG_REP
-        printf("repGetEEInfo - fell to default params\n");
-#endif
     }
 }
 
@@ -6137,7 +6203,7 @@ mdMethodDef MethodContext::repGetMethodDefFromMethod(CORINFO_METHOD_HANDLE hMeth
 
     int index = GetMethodDefFromMethod->GetIndex((DWORDLONG)hMethod);
     if (index < 0)
-        return (mdMethodDef)0x06000001;    
+        return (mdMethodDef)0x06000001;
 
     return (mdMethodDef)GetMethodDefFromMethod->Get((DWORDLONG)hMethod);
 }

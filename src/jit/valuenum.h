@@ -205,6 +205,7 @@ private:
     int GetConstantInt32(ValueNum argVN);
     INT64 GetConstantInt64(ValueNum argVN);
     double GetConstantDouble(ValueNum argVN);
+    float GetConstantSingle(ValueNum argVN);
 
     // Assumes that all the ValueNum arguments of each of these functions have been shown to represent constants.
     // Assumes that "vnf" is a operator of the appropriate arity (unary for the first, binary for the second).
@@ -217,7 +218,7 @@ private:
 
 #ifdef DEBUG
     // This helps test some performance pathologies related to "evaluation" of VNF_MapSelect terms,
-    // especially relating to the heap.  We count the number of applications of such terms we consider,
+    // especially relating to GcHeap/ByrefExposed.  We count the number of applications of such terms we consider,
     // and if this exceeds a limit, indicated by a COMPlus_ variable, we assert.
     unsigned m_numMapSels;
 #endif
@@ -295,13 +296,6 @@ public:
     {
         // We reserve Chunk 0 for "special" VNs.  Let SRC_ZeroMap (== 1) be the zero map.
         return ValueNum(SRC_ZeroMap);
-    }
-
-    // The value number for the special "NotAField" field sequence.
-    static ValueNum VNForNotAField()
-    {
-        // We reserve Chunk 0 for "special" VNs.  Let SRC_NotAField (== 2) be the "not a field seq".
-        return ValueNum(SRC_NotAField);
     }
 
     // The ROH map is the map for the "read-only heap".  We assume that this is never mutated, and always
@@ -504,6 +498,9 @@ public:
                                bool         srcIsUnsigned    = false,
                                bool         hasOverflowCheck = false);
 
+    // Returns true iff the VN represents an application of VNF_NotAField.
+    bool IsVNNotAField(ValueNum vn);
+
     // PtrToLoc values need to express a field sequence as one of their arguments.  VN for null represents
     // empty sequence, otherwise, "FieldSeq(VN(FieldHandle), restOfSeq)".
     ValueNum VNForFieldSeq(FieldSeqNode* fieldSeq);
@@ -515,12 +512,6 @@ public:
     // Both argument must represent field sequences; returns the value number representing the
     // concatenation "fsVN1 || fsVN2".
     ValueNum FieldSeqVNAppend(ValueNum fsVN1, ValueNum fsVN2);
-
-    // Requires "lclVarVN" be a value number for a GT_LCL_VAR pointer tree.
-    // Requires "fieldSeqVN" be a field sequence value number.
-    // Requires "typ" to be a TYP_REF/TYP_BYREF used for VNF_PtrToLoc.
-    // When "fieldSeqVN" is VNForNotAField, a unique VN is generated using m_uPtrToLocNotAFieldCount.
-    ValueNum VNForPtrToLoc(var_types typ, ValueNum lclVarVN, ValueNum fieldSeqVN);
 
     // If "opA" has a PtrToLoc, PtrToArrElem, or PtrToStatic application as its value numbers, and "opB" is an integer
     // with a "fieldSeq", returns the VN for the pointer form extended with the field sequence; or else NoVN.
@@ -545,6 +536,17 @@ public:
 
     // Returns true iff the VN represents an integeral constant.
     bool IsVNInt32Constant(ValueNum vn);
+
+    struct ArrLenUnsignedBoundInfo
+    {
+        unsigned cmpOper;
+        ValueNum vnIdx;
+        ValueNum vnLen;
+
+        ArrLenUnsignedBoundInfo() : cmpOper(GT_NONE), vnIdx(NoVN), vnLen(NoVN)
+        {
+        }
+    };
 
     struct ArrLenArithBoundInfo
     {
@@ -616,6 +618,9 @@ public:
     // If "vn" is constant bound, then populate the "info" fields for constVal, cmpOp, cmpOper.
     void GetConstantBoundInfo(ValueNum vn, ConstantBoundInfo* info);
 
+    // If "vn" is of the form "(uint)var < (uint)a.len" (or equivalent) return true.
+    bool IsVNArrLenUnsignedBound(ValueNum vn, ArrLenUnsignedBoundInfo* info);
+
     // If "vn" is of the form "var < a.len" or "a.len <= var" return true.
     bool IsVNArrLenBound(ValueNum vn);
 
@@ -673,9 +678,13 @@ private:
                 __fallthrough;
 
             case TYP_BYREF:
-#ifndef PLATFORM_UNIX
+
+#ifdef _MSC_VER
+
                 assert(&typeid(T) == &typeid(size_t)); // We represent ref/byref constants as size_t's.
-#endif                                                 // PLATFORM_UNIX
+
+#endif // _MSC_VER
+
                 __fallthrough;
 
             case TYP_INT:
@@ -772,7 +781,7 @@ public:
     // the function application it represents; otherwise, return "false."
     bool GetVNFunc(ValueNum vn, VNFuncApp* funcApp);
 
-    // Requires that "vn" represents a "heap address" the sum of a "TYP_REF" value and some integer
+    // Requires that "vn" represents a "GC heap address" the sum of a "TYP_REF" value and some integer
     // value.  Returns the TYP_REF value.
     ValueNum VNForRefInAddr(ValueNum vn);
 
@@ -851,14 +860,15 @@ private:
 
     DECLARE_TYPED_ENUM(ChunkExtraAttribs, BYTE)
     {
-        CEA_None,       // No extra attributes.
-            CEA_Const,  // This chunk contains constant values.
-            CEA_Handle, // This chunk contains handle constants.
-            CEA_Func0,  // Represents functions of arity 0.
-            CEA_Func1,  // ...arity 1.
-            CEA_Func2,  // ...arity 2.
-            CEA_Func3,  // ...arity 3.
-            CEA_Func4,  // ...arity 4.
+        CEA_None,          // No extra attributes.
+            CEA_Const,     // This chunk contains constant values.
+            CEA_Handle,    // This chunk contains handle constants.
+            CEA_NotAField, // This chunk contains "not a field" values.
+            CEA_Func0,     // Represents functions of arity 0.
+            CEA_Func1,     // ...arity 1.
+            CEA_Func2,     // ...arity 2.
+            CEA_Func3,     // ...arity 3.
+            CEA_Func4,     // ...arity 4.
             CEA_Count
     }
     END_DECLARE_TYPED_ENUM(ChunkExtraAttribs, BYTE);
@@ -1260,17 +1270,12 @@ private:
     {
         SRC_Null,
         SRC_ZeroMap,
-        SRC_NotAField,
         SRC_ReadOnlyHeap,
         SRC_Void,
         SRC_EmptyExcSet,
 
         SRC_NumSpecialRefConsts
     };
-
-    // Counter to keep track of all the unique not a field sequences that have been assigned to
-    // PtrToLoc, because the ptr was added to an offset that was not a field.
-    unsigned m_uPtrToLocNotAFieldCount;
 
     // The "values" of special ref consts will be all be "null" -- their differing meanings will
     // be carried by the distinct value numbers.

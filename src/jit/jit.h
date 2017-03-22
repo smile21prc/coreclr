@@ -28,6 +28,7 @@
 
 #ifdef _MSC_VER
 // These don't seem useful, so turning them off is no big deal
+#pragma warning(disable : 4065) // "switch statement contains 'default' but no 'case' labels" (happens due to #ifdefs)
 #pragma warning(disable : 4510) // can't generate default constructor
 #pragma warning(disable : 4511) // can't generate copy constructor
 #pragma warning(disable : 4512) // can't generate assignment constructor
@@ -171,6 +172,31 @@
 #define _TARGET_ARMARCH_
 #endif
 
+// If the UNIX_AMD64_ABI is defined make sure that _TARGET_AMD64_ is also defined.
+#if defined(UNIX_AMD64_ABI)
+#if !defined(_TARGET_AMD64_)
+#error When UNIX_AMD64_ABI is defined you must define _TARGET_AMD64_ defined as well.
+#endif
+#endif
+
+// If the UNIX_X86_ABI is defined make sure that _TARGET_X86_ is also defined.
+#if defined(UNIX_X86_ABI)
+#if !defined(_TARGET_X86_)
+#error When UNIX_X86_ABI is defined you must define _TARGET_X86_ defined as well.
+#endif
+#endif
+
+#if defined(PLATFORM_UNIX)
+#define _HOST_UNIX_
+#endif
+
+// Are we generating code to target Unix? This is true if we will run on Unix (_HOST_UNIX_ is defined).
+// It's also true if we are building an altjit targetting Unix, which we determine by checking if either
+// UNIX_AMD64_ABI or UNIX_X86_ABI is defined.
+#if defined(_HOST_UNIX_) || ((defined(UNIX_AMD64_ABI) || defined(UNIX_X86_ABI)) && defined(ALT_JIT))
+#define _TARGET_UNIX_
+#endif
+
 // --------------------------------------------------------------------------------
 // IMAGE_FILE_MACHINE_TARGET
 // --------------------------------------------------------------------------------
@@ -189,7 +215,14 @@
 
 // Include the AMD64 unwind codes when appropriate.
 #if defined(_TARGET_AMD64_)
+// We need to temporarily set PLATFORM_UNIX, if necessary, to get the Unix-specific unwind codes.
+#if defined(_TARGET_UNIX_) && !defined(_HOST_UNIX_)
+#define PLATFORM_UNIX
+#endif
 #include "win64unwind.h"
+#if defined(_TARGET_UNIX_) && !defined(_HOST_UNIX_)
+#undef PLATFORM_UNIX
+#endif
 #endif
 
 // Macros for defining strongly-typed enums. Use as follows:
@@ -209,6 +242,7 @@
 
 #include "corhdr.h"
 #include "corjit.h"
+#include "jitee.h"
 
 #define __OPERATOR_NEW_INLINE 1 // indicate that I will define these
 #define __PLACEMENT_NEW_INLINE  // don't bring in the global placement new, it is easy to make a mistake
@@ -386,17 +420,6 @@ typedef ptrdiff_t ssize_t;
 
 /*****************************************************************************/
 
-// Debugging support is ON by default. Can be turned OFF by
-// adding /DDEBUGGING_SUPPORT=0 on the command line.
-
-#ifndef DEBUGGING_SUPPORT
-#define DEBUGGING_SUPPORT
-#elif !DEBUGGING_SUPPORT
-#undef DEBUGGING_SUPPORT
-#endif
-
-/*****************************************************************************/
-
 // Late disassembly is OFF by default. Can be turned ON by
 // adding /DLATE_DISASM=1 on the command line.
 // Always OFF in the non-debug version
@@ -422,14 +445,6 @@ typedef ptrdiff_t ssize_t;
 #define ASSERTION_PROP 1 // Enable value/assertion propagation
 
 #define LOCAL_ASSERTION_PROP ASSERTION_PROP // Enable local assertion propagation
-
-//=============================================================================
-
-#define FANCY_ARRAY_OPT 0 // optimize more complex index checks
-
-//=============================================================================
-
-#define LONG_ASG_OPS 0 // implementation isn't complete yet
 
 //=============================================================================
 
@@ -708,11 +723,7 @@ inline unsigned int unsigned_abs(int x)
 #ifdef _TARGET_64BIT_
 inline size_t unsigned_abs(ssize_t x)
 {
-#ifndef FEATURE_PAL
     return ((size_t)abs(x));
-#else  // !FEATURE_PAL
-    return ((size_t)labs(x));
-#endif // !FEATURE_PAL
 }
 #endif // _TARGET_64BIT_
 
@@ -839,7 +850,7 @@ extern int jitNativeCode(CORINFO_METHOD_HANDLE methodHnd,
                          CORINFO_METHOD_INFO*  methodInfo,
                          void**                methodCodePtr,
                          ULONG*                methodCodeSize,
-                         CORJIT_FLAGS*         compileFlags,
+                         JitFlags*             compileFlags,
                          void*                 inlineInfoPtr);
 
 #ifdef _HOST_64BIT_

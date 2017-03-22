@@ -2090,11 +2090,9 @@ struct StackTraceElement
     UINT_PTR        ip;
     UINT_PTR        sp;
     DWORD_PTR       pFunc;  // MethodDesc
-#if defined(FEATURE_EXCEPTIONDISPATCHINFO)
     // TRUE if this element represents the last frame of the foreign
     // exception stack trace.
     BOOL            fIsLastFrameFromForeignStackTrace;
-#endif // defined(FEATURE_EXCEPTIONDISPATCHINFO)
 
 };
 
@@ -4361,8 +4359,10 @@ DECLARE_API(VerifyObj)
         ExtOut("Unable to build snapshot of the garbage collector state\n");
         goto Exit;
     }
-    DacpGcHeapDetails *pheapDetails = g_snapshot.GetHeap(taddrObj);
-    bValid = VerifyObject(*pheapDetails, taddrObj, taddrMT, objSize, TRUE);
+    {
+        DacpGcHeapDetails *pheapDetails = g_snapshot.GetHeap(taddrObj);
+        bValid = VerifyObject(*pheapDetails, taddrObj, taddrMT, objSize, TRUE);
+    }
 
 Exit:
     if (bValid)
@@ -5888,6 +5888,56 @@ HRESULT PrintSpecialThreads()
 }
 #endif //FEATURE_PAL
 
+HRESULT SwitchToExceptionThread()
+{
+    HRESULT Status;
+    
+    DacpThreadStoreData ThreadStore;
+    if ((Status = ThreadStore.Request(g_sos)) != S_OK)
+    {
+        Print("Failed to request ThreadStore\n");
+        return Status;
+    }
+
+    DacpThreadData Thread;
+    CLRDATA_ADDRESS CurThread = ThreadStore.firstThread;
+    while (CurThread)
+    {
+        if (IsInterrupt())
+            break;
+
+        if ((Status = Thread.Request(g_sos, CurThread)) != S_OK)
+        {
+            PrintLn("Failed to request Thread at ", Pointer(CurThread));
+            return Status;
+        }
+        
+        TADDR taLTOH;
+        if (Thread.lastThrownObjectHandle != NULL)
+        {
+            if (SafeReadMemory(TO_TADDR(Thread.lastThrownObjectHandle), &taLTOH, sizeof(taLTOH), NULL))
+            {
+                if (taLTOH != NULL)
+                {
+                    ULONG id;
+                    if (g_ExtSystem->GetThreadIdBySystemId(Thread.osThreadId, &id) == S_OK)
+                    {
+                        if (g_ExtSystem->SetCurrentThreadId(id) == S_OK)
+                        {
+                            PrintLn("Found managed exception on thread ", ThreadID(Thread.osThreadId));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        CurThread = Thread.nextThread;
+    }
+
+    return Status;
+}
+
 struct ThreadStateTable
 {
     unsigned int State;
@@ -5961,12 +6011,14 @@ DECLARE_API(Threads)
 
     BOOL bPrintSpecialThreads = FALSE;
     BOOL bPrintLiveThreadsOnly = FALSE;
+    BOOL bSwitchToManagedExceptionThread = FALSE;
     BOOL dml = FALSE;
 
     CMDOption option[] = 
     {   // name, vptr, type, hasValue
         {"-special", &bPrintSpecialThreads, COBOOL, FALSE},
         {"-live", &bPrintLiveThreadsOnly, COBOOL, FALSE},
+        {"-managedexception", &bSwitchToManagedExceptionThread, COBOOL, FALSE},
 #ifndef FEATURE_PAL
         {"/d", &dml, COBOOL, FALSE},
 #endif
@@ -5974,6 +6026,11 @@ DECLARE_API(Threads)
     if (!GetCMDOption(args, option, _countof(option), NULL, 0, NULL)) 
     {
         return Status;
+    }
+
+    if (bSwitchToManagedExceptionThread)
+    {
+        return SwitchToExceptionThread();
     }
     
     // We need to support minidumps for this command.
@@ -8781,28 +8838,28 @@ void PrintInterestingGCInfo(DacpGCInterestingInfoData* dataPerHeap)
 {
     ExtOut("Interesting data points\n");
     size_t* data = dataPerHeap->interestingDataPoints;
-    for (int i = 0; i < NUM_GC_DATA_POINTS; i++)
+    for (int i = 0; i < DAC_NUM_GC_DATA_POINTS; i++)
     {
         ExtOut("%20s: %d\n", str_interesting_data_points[i], data[i]);
     }
 
     ExtOut("\nCompacting reasons\n");
     data = dataPerHeap->compactReasons;
-    for (int i = 0; i < MAX_COMPACT_REASONS_COUNT; i++)
+    for (int i = 0; i < DAC_MAX_COMPACT_REASONS_COUNT; i++)
     {
         ExtOut("[%s]%35s: %d\n", (gc_heap_compact_reason_mandatory_p[i] ? "M" : "W"), str_heap_compact_reasons[i], data[i]);
     }
 
     ExtOut("\nExpansion mechanisms\n");
     data = dataPerHeap->expandMechanisms;
-    for (int i = 0; i < MAX_EXPAND_MECHANISMS_COUNT; i++)
+    for (int i = 0; i < DAC_MAX_EXPAND_MECHANISMS_COUNT; i++)
     {
         ExtOut("%30s: %d\n", str_heap_expand_mechanisms[i], data[i]);
     }
 
     ExtOut("\nOther mechanisms enabled\n");
     data = dataPerHeap->bitMechanisms;
-    for (int i = 0; i < MAX_GC_MECHANISM_BITS_COUNT; i++)
+    for (int i = 0; i < DAC_MAX_GC_MECHANISM_BITS_COUNT; i++)
     {
         ExtOut("%20s: %d\n", str_bit_mechanisms[i], data[i]);
     }
@@ -8824,7 +8881,7 @@ DECLARE_API(DumpGCData)
 
     DacpGCInterestingInfoData interestingInfo;
     interestingInfo.RequestGlobal(g_sos);
-    for (int i = 0; i < MAX_GLOBAL_GC_MECHANISMS_COUNT; i++)
+    for (int i = 0; i < DAC_MAX_GLOBAL_GC_MECHANISMS_COUNT; i++)
     {
         ExtOut("%-30s: %d\n", str_gc_global_mechanisms[i], interestingInfo.globalMechanisms[i]);
     }
@@ -9119,7 +9176,7 @@ DECLARE_API (ProcInfo)
         if (pFntGetProcessTimes && pFntGetProcessTimes (hProcess,&CreationTime,&ExitTime,&KernelTime,&UserTime)) {
             ExtOut("---------------------------------------\n");
             ExtOut("Process Times\n");
-            static char *Month[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+            static const char *Month[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
                         "Oct", "Nov", "Dec"};
             SYSTEMTIME SystemTime;
             FILETIME LocalFileTime;

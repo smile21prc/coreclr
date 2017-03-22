@@ -34,6 +34,79 @@ typedef enum
     SUSPEND_FOR_GC_PREP = 6
 } SUSPEND_REASON;
 
+typedef enum
+{
+    walk_for_gc = 1,
+    walk_for_bgc = 2,
+    walk_for_loh = 3
+} walk_surv_type;
+
+// Different operations that can be done by GCToEEInterface::StompWriteBarrier
+enum class WriteBarrierOp
+{
+    StompResize,
+    StompEphemeral,
+    Initialize,
+    SwitchToWriteWatch,
+    SwitchToNonWriteWatch
+};
+
+// Arguments to GCToEEInterface::StompWriteBarrier
+struct WriteBarrierParameters
+{
+    // The operation that StompWriteBarrier will perform.
+    WriteBarrierOp operation;
+
+    // Whether or not the runtime is currently suspended. If it is not,
+    // the EE will need to suspend it before bashing the write barrier.
+    // Used for all operations.
+    bool is_runtime_suspended;
+
+    // Whether or not the GC has moved the ephemeral generation to no longer
+    // be at the top of the heap. When the ephemeral generation is at the top
+    // of the heap, and the write barrier observes that a pointer is greater than
+    // g_ephemeral_low, it does not need to check that the pointer is less than
+    // g_ephemeral_high because there is nothing in the GC heap above the ephemeral
+    // generation. When this is not the case, however, the GC must inform the EE
+    // so that the EE can switch to a write barrier that checks that a pointer
+    // is both greater than g_ephemeral_low and less than g_ephemeral_high.
+    // Used for WriteBarrierOp::StompResize.
+    bool requires_upper_bounds_check;
+
+    // The new card table location. May or may not be the same as the previous
+    // card table. Used for WriteBarrierOp::Initialize and WriteBarrierOp::StompResize.
+    uint32_t* card_table;
+
+    // The new card bundle table location. May or may not be the same as the previous
+    // card bundle table. Used for WriteBarrierOp::Initialize and WriteBarrierOp::StompResize.
+    uint32_t* card_bundle_table;
+
+    // The heap's new low boundary. May or may not be the same as the previous
+    // value. Used for WriteBarrierOp::Initialize and WriteBarrierOp::StompResize.
+    uint8_t* lowest_address;
+
+    // The heap's new high boundary. May or may not be the same as the previous
+    // value. Used for WriteBarrierOp::Initialize and WriteBarrierOp::StompResize.
+    uint8_t* highest_address;
+
+    // The new start of the ephemeral generation. 
+    // Used for WriteBarrierOp::StompEphemeral.
+    uint8_t* ephemeral_low;
+
+    // The new end of the ephemeral generation.
+    // Used for WriteBarrierOp::StompEphemeral.
+    uint8_t* ephemeral_high;
+
+    // The new write watch table, if we are using our own write watch
+    // implementation. Used for WriteBarrierOp::SwitchToWriteWatch only.
+    uint8_t* write_watch_table;
+};
+
+ /*
+  * Scanning callback.
+  */
+typedef void (CALLBACK *HANDLESCANPROC)(PTR_UNCHECKED_OBJECTREF pref, uintptr_t *pExtraInfo, uintptr_t param1, uintptr_t param2);
+
 #include "gcinterface.ee.h"
 
 // The allocation context must be known to the VM for use in the allocation
@@ -65,6 +138,8 @@ public:
     }
 };
 
+#include "gcinterface.dac.h"
+
 // stub type to abstract a heap segment
 struct gc_heap_segment_stub;
 typedef gc_heap_segment_stub *segment_handle;
@@ -88,31 +163,25 @@ struct segment_info
 // one for the object header, and one for the first field in the object.
 #define min_obj_size ((sizeof(uint8_t*) + sizeof(uintptr_t) + sizeof(size_t)))
 
+#define max_generation 2
+
+// The bit shift used to convert a memory address into an index into the
+// Software Write Watch table.
+#define SOFTWARE_WRITE_WATCH_AddressToTableByteIndexShift 0xc
+
 class Object;
 class IGCHeap;
 
 // Initializes the garbage collector. Should only be called
-// once, during EE startup.
-IGCHeap* InitializeGarbageCollector(IGCToCLR* clrToGC);
+// once, during EE startup. Returns true if the initialization
+// was successful, false otherwise.
+bool InitializeGarbageCollector(IGCToCLR* clrToGC, IGCHeap **gcHeap, GcDacVars* gcDacVars);
 
 // The runtime needs to know whether we're using workstation or server GC 
 // long before the GCHeap is created. This function sets the type of
 // heap that will be created, before InitializeGarbageCollector is called
 // and the heap is actually recated.
 void InitializeHeapType(bool bServerHeap);
-
-#ifndef DACCESS_COMPILE
-extern "C" {
-#endif // !DACCESS_COMPILE
-GPTR_DECL(uint8_t,g_lowest_address);
-GPTR_DECL(uint8_t,g_highest_address);
-GPTR_DECL(uint32_t,g_card_table);
-#ifndef DACCESS_COMPILE
-} 
-#endif // !DACCESS_COMPILE
-
-extern "C" uint8_t* g_ephemeral_low;
-extern "C" uint8_t* g_ephemeral_high;
 
 #ifdef WRITE_BARRIER_CHECK
 //always defined, but should be 0 in Server GC
@@ -124,8 +193,6 @@ extern uint8_t* g_shadow_lowest_address;
 
 // For low memory notification from host
 extern int32_t g_bLowMemoryFromHost;
-
-extern VOLATILE(int32_t) m_GCLock;
 
 // !!!!!!!!!!!!!!!!!!!!!!!
 // make sure you change the def in bcl\system\gc.cs 
@@ -172,8 +239,151 @@ enum end_no_gc_region_status
     end_no_gc_alloc_exceeded = 3
 };
 
+typedef enum 
+{
+    /*
+     * WEAK HANDLES
+     *
+     * Weak handles are handles that track an object as long as it is alive,
+     * but do not keep the object alive if there are no strong references to it.
+     *
+     */
+
+    /*
+     * SHORT-LIVED WEAK HANDLES
+     *
+     * Short-lived weak handles are weak handles that track an object until the
+     * first time it is detected to be unreachable.  At this point, the handle is
+     * severed, even if the object will be visible from a pending finalization
+     * graph.  This further implies that short weak handles do not track
+     * across object resurrections.
+     *
+     */
+    HNDTYPE_WEAK_SHORT   = 0,
+
+    /*
+     * LONG-LIVED WEAK HANDLES
+     *
+     * Long-lived weak handles are weak handles that track an object until the
+     * object is actually reclaimed.  Unlike short weak handles, long weak handles
+     * continue to track their referents through finalization and across any
+     * resurrections that may occur.
+     *
+     */
+    HNDTYPE_WEAK_LONG    = 1,
+    HNDTYPE_WEAK_DEFAULT = 1,
+
+    /*
+     * STRONG HANDLES
+     *
+     * Strong handles are handles which function like a normal object reference.
+     * The existence of a strong handle for an object will cause the object to
+     * be promoted (remain alive) through a garbage collection cycle.
+     *
+     */
+    HNDTYPE_STRONG       = 2,
+    HNDTYPE_DEFAULT      = 2,
+
+    /*
+     * PINNED HANDLES
+     *
+     * Pinned handles are strong handles which have the added property that they
+     * prevent an object from moving during a garbage collection cycle.  This is
+     * useful when passing a pointer to object innards out of the runtime while GC
+     * may be enabled.
+     *
+     * NOTE:  PINNING AN OBJECT IS EXPENSIVE AS IT PREVENTS THE GC FROM ACHIEVING
+     *        OPTIMAL PACKING OF OBJECTS DURING EPHEMERAL COLLECTIONS.  THIS TYPE
+     *        OF HANDLE SHOULD BE USED SPARINGLY!
+     */
+    HNDTYPE_PINNED       = 3,
+
+    /*
+     * VARIABLE HANDLES
+     *
+     * Variable handles are handles whose type can be changed dynamically.  They
+     * are larger than other types of handles, and are scanned a little more often,
+     * but are useful when the handle owner needs an efficient way to change the
+     * strength of a handle on the fly.
+     * 
+     */
+    HNDTYPE_VARIABLE     = 4,
+
+    /*
+     * REFCOUNTED HANDLES
+     *
+     * Refcounted handles are handles that behave as strong handles while the
+     * refcount on them is greater than 0 and behave as weak handles otherwise.
+     *
+     * N.B. These are currently NOT general purpose.
+     *      The implementation is tied to COM Interop.
+     *
+     */
+    HNDTYPE_REFCOUNTED   = 5,
+
+    /*
+     * DEPENDENT HANDLES
+     *
+     * Dependent handles are two handles that need to have the same lifetime.  One handle refers to a secondary object 
+     * that needs to have the same lifetime as the primary object. The secondary object should not cause the primary 
+     * object to be referenced, but as long as the primary object is alive, so must be the secondary
+     *
+     * They are currently used for EnC for adding new field members to existing instantiations under EnC modes where
+     * the primary object is the original instantiation and the secondary represents the added field.
+     *
+     * They are also used to implement the ConditionalWeakTable class in mscorlib.dll. If you want to use
+     * these from managed code, they are exposed to BCL through the managed DependentHandle class.
+     *
+     *
+     */
+    HNDTYPE_DEPENDENT    = 6,
+
+    /*
+     * PINNED HANDLES for asynchronous operation
+     *
+     * Pinned handles are strong handles which have the added property that they
+     * prevent an object from moving during a garbage collection cycle.  This is
+     * useful when passing a pointer to object innards out of the runtime while GC
+     * may be enabled.
+     *
+     * NOTE:  PINNING AN OBJECT IS EXPENSIVE AS IT PREVENTS THE GC FROM ACHIEVING
+     *        OPTIMAL PACKING OF OBJECTS DURING EPHEMERAL COLLECTIONS.  THIS TYPE
+     *        OF HANDLE SHOULD BE USED SPARINGLY!
+     */
+    HNDTYPE_ASYNCPINNED  = 7,
+
+    /*
+     * SIZEDREF HANDLES
+     *
+     * SizedRef handles are strong handles. Each handle has a piece of user data associated
+     * with it that stores the size of the object this handle refers to. These handles
+     * are scanned as strong roots during each GC but only during full GCs would the size
+     * be calculated.
+     *
+     */
+    HNDTYPE_SIZEDREF     = 8,
+
+    /*
+     * WINRT WEAK HANDLES
+     *
+     * WinRT weak reference handles hold two different types of weak handles to any
+     * RCW with an underlying COM object that implements IWeakReferenceSource.  The
+     * object reference itself is a short weak handle to the RCW.  In addition an
+     * IWeakReference* to the underlying COM object is stored, allowing the handle
+     * to create a new RCW if the existing RCW is collected.  This ensures that any
+     * code holding onto a WinRT weak reference can always access an RCW to the
+     * underlying COM object as long as it has not been released by all of its strong
+     * references.
+     */
+    HNDTYPE_WEAK_WINRT   = 9
+} HandleType;
+
 typedef BOOL (* walk_fn)(Object*, void*);
 typedef void (* gen_walk_fn)(void* context, int generation, uint8_t* range_start, uint8_t* range_end, uint8_t* range_reserved);
+typedef void (* record_surv_fn)(uint8_t* begin, uint8_t* end, ptrdiff_t reloc, size_t context, BOOL compacting_p, BOOL bgc_p);
+typedef void (* fq_walk_fn)(BOOL, void*);
+typedef void (* fq_scan_fn)(Object** ppObject, ScanContext *pSC, uint32_t dwFlags);
+typedef void (* handle_scan_fn)(Object** pRef, Object* pSec, uint32_t flags, ScanContext* context, BOOL isDependent);
 
 // IGCHeap is the interface that the VM will use when interacting with the GC.
 class IGCHeap {
@@ -251,6 +461,10 @@ public:
 
     // Gets the next finalizable object.
     virtual Object* GetNextFinalizable() = 0;
+
+    // Sets whether or not the GC should report all finalizable objects as
+    // ready to be finalized, instead of only collectable objects.
+    virtual void SetFinalizeRunOnShutdown(bool value) = 0;
 
     /*
     ===========================================================================
@@ -347,9 +561,6 @@ public:
     // sanity checks asserting that a GC has not occured.
     virtual unsigned GetGcCount() = 0;
 
-    // Sets cards after an object has been memmoved. 
-    virtual void SetCardsAfterBulkCopy(Object** obj, size_t length) = 0;
-
     // Gets whether or not the home heap of this alloc context matches the heap
     // associated with this thread.
     virtual bool IsThreadUsingAllocationContextHeap(gc_alloc_context* acontext, int thread_number) = 0;
@@ -369,6 +580,9 @@ public:
 
     // Sets whether or not a GC is in progress.
     virtual void SetGCInProgress(BOOL fInProgress) = 0;
+
+    // Gets whether or not the GC runtime structures are in a valid state for heap traversal.
+    virtual bool RuntimeStructuresValid() = 0;
 
     /*
     ============================================================================
@@ -393,36 +607,29 @@ public:
     Allocation routines. These all call into the GC's allocator and may trigger a garbage
     collection. All allocation routines return NULL when the allocation request
     couldn't be serviced due to being out of memory.
-
-    These allocation routines should not be called with allocation requests
-    larger than:
-       32-bit  -> 0x7FFFFFE0
-       64-bit  -> 0x7FFFFFFFFFFFFFE0
-
-    It is up to the caller of the API to raise appropriate errors if the amount
-    of requested memory is too large.
     ===========================================================================
     */
 
     // Allocates an object on the given allocation context with the given size and flags.
+    // It is the responsibility of the caller to ensure that the passed-in alloc context is
+    // owned by the thread that is calling this function. If using per-thread alloc contexts,
+    // no lock is needed; callers not using per-thread alloc contexts will need to acquire
+    // a lock to ensure that the calling thread has unique ownership over this alloc context;
     virtual Object* Alloc(gc_alloc_context* acontext, size_t size, uint32_t flags) = 0;
-
-    // Allocates an object on the default allocation context with the given size and flags.
-    virtual Object* Alloc(size_t size, uint32_t flags) = 0;
 
     // Allocates an object on the large object heap with the given size and flags.
     virtual Object* AllocLHeap(size_t size, uint32_t flags) = 0;
 
-    // Allocates an object on the default allocation context, aligned to 64 bits,
-    // with the given size and flags.
-    virtual Object* AllocAlign8 (size_t size, uint32_t flags) = 0;
-
     // Allocates an object on the given allocation context, aligned to 64 bits,
     // with the given size and flags.
-    virtual Object* AllocAlign8 (gc_alloc_context* acontext, size_t size, uint32_t flags) = 0;
+    // It is the responsibility of the caller to ensure that the passed-in alloc context is
+    // owned by the thread that is calling this function. If using per-thread alloc contexts,
+    // no lock is needed; callers not using per-thread alloc contexts will need to acquire
+    // a lock to ensure that the calling thread has unique ownership over this alloc context.
+    virtual Object* AllocAlign8(gc_alloc_context* acontext, size_t size, uint32_t flags) = 0;
 
-    // If allocating on the LOH, blocks if a BGC is in a position (concurrent mark)
-    // where the LOH allocator can't allocate.
+    // This is for the allocator to indicate it's done allocating a large object during a 
+    // background GC as the BGC threads also need to walk LOH.
     virtual void PublishObject(uint8_t* obj) = 0;
 
     // Gets the event that suspended threads will use to wait for the
@@ -457,13 +664,31 @@ public:
     */
 
     // Walks an object, invoking a callback on each member.
-    virtual void WalkObject(Object* obj, walk_fn fn, void* context) = 0;
+    virtual void DiagWalkObject(Object* obj, walk_fn fn, void* context) = 0;
+
+    // Walk the heap object by object.
+    virtual void DiagWalkHeap(walk_fn fn, void* context, int gen_number, BOOL walk_large_object_heap_p) = 0;
+    
+    // Walks the survivors and get the relocation information if objects have moved.
+    virtual void DiagWalkSurvivorsWithType(void* gc_context, record_surv_fn fn, size_t diag_context, walk_surv_type type) = 0;
+
+    // Walks the finalization queue.
+    virtual void DiagWalkFinalizeQueue(void* gc_context, fq_walk_fn fn) = 0;
+
+    // Scan roots on finalizer queue. This is a generic function.
+    virtual void DiagScanFinalizeQueue(fq_scan_fn fn, ScanContext* context) = 0;
+
+    // Scan handles for profiling or ETW.
+    virtual void DiagScanHandles(handle_scan_fn fn, int gen_number, ScanContext* context) = 0;
+
+    // Scan dependent handles for profiling or ETW.
+    virtual void DiagScanDependentHandles(handle_scan_fn fn, int gen_number, ScanContext* context) = 0;
 
     // Describes all generations to the profiler, invoking a callback on each generation.
-    virtual void DescrGenerationsToProfiler(gen_walk_fn fn, void* context) = 0;
+    virtual void DiagDescrGenerations(gen_walk_fn fn, void* context) = 0;
 
     // Traces all GC segments and fires ETW events with information on them.
-    virtual void TraceGCSegments() = 0;
+    virtual void DiagTraceGCSegments() = 0;
 
     /*
     ===========================================================================
@@ -471,8 +696,9 @@ public:
     ===========================================================================
     */
 
-    // Returns TRUE if GC actually happens, otherwise FALSE
-    virtual BOOL StressHeap(gc_alloc_context* acontext = 0) = 0;
+    // Returns TRUE if GC actually happens, otherwise FALSE. The passed alloc context
+    // must not be null.
+    virtual BOOL StressHeap(gc_alloc_context* acontext) = 0;
 
     /*
     ===========================================================================
@@ -557,27 +783,5 @@ struct ScanContext
 #endif // FEATURE_EVENT_TRACE
     }
 };
-
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-struct ProfilingScanContext : ScanContext
-{
-    BOOL fProfilerPinned;
-    void * pvEtwContext;
-    void *pHeapId;
-    
-    ProfilingScanContext(BOOL fProfilerPinnedParam) : ScanContext()
-    {
-        LIMITED_METHOD_CONTRACT;
-
-        pHeapId = NULL;
-        fProfilerPinned = fProfilerPinnedParam;
-        pvEtwContext = NULL;
-#ifdef FEATURE_CONSERVATIVE_GC
-        // To not confuse GCScan::GcScanRoots
-        promotion = g_pConfig->GetGCConservative();
-#endif
-    }
-};
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 
 #endif // _GC_INTERFACE_H_

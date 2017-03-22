@@ -50,7 +50,7 @@
     <_CLRTestNeedsProjectToRun Condition=" '$(_CLRTestNeedsToRun)' and '!$(_CLRTestBuildsExecutable)' ">true</_CLRTestNeedsProjectToRun>
   </PropertyGroup>
 
-  <PropertyGroup Condition="'$(ReferenceLocalMscorlib)' == 'true'">
+  <PropertyGroup Condition="'$(ReferenceSystemPrivateCoreLib)' == 'true'">
     <ProjectJson>$(SourceDir)Common/empty/project.json</ProjectJson>
     <ProjectLockJson>$(SourceDir)Common/empty/project.lock.json</ProjectLockJson>
   </PropertyGroup>
@@ -87,11 +87,6 @@
     <MSBuild Projects="@(ProjectReference)" />
     <MakeDir Condition="'$(CLRTestKind)' == 'RunOnly'" ContinueOnError="false" Directories="$(OutputPath)" />
   </Target>
- 
-  <Target Name="CopyJsonProjectFiles" AfterTargets="Build">  
-    <!-- Post build copy project json files so we can generate assembly lists for the projects -->  
-    <Copy SourceFiles="$(ProjectLockJson)" DestinationFolder="$(OutputPath)" Condition="Exists('$(ProjectLockJson)')" />  
-  </Target>  
   
   <!-- We will use an imported build here in the instance that we have source that we need to build, and we are the correct priority...OR if we are being asked to build for
   a test with a higher priority. -->
@@ -178,4 +173,20 @@
     </ItemGroup>
   </Target>
 
+  <Target Name="UpdateReferenceItems"
+          BeforeTargets="BeforeResolveReferences"
+  >
+    <ItemGroup>
+      <Reference Include="$(TargetingPackPath)/*.dll" >
+        <Private>false</Private>
+      </Reference>
+    </ItemGroup>
+
+  </Target>
+
+  <Target Name="CopyReflectionRoots">  
+    <Copy SourceFiles="$(AssemblyName).reflect.xml" 
+          DestinationFolder="$(OutputPath)"
+	  Condition="Exists('$(AssemblyName).reflect.xml')"/>  
+  </Target>  
 </Project>

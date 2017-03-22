@@ -1950,17 +1950,18 @@ size_t GetLogicalProcessorCacheSizeFromOS()
 
     // Crack the information. Iterate through all the SLPI array entries for all processors in system.
     // Will return the greatest of all the processor cache sizes or zero
-
-    size_t last_cache_size = 0;
-
-    for (DWORD i=0; i < nEntries; i++)
     {
-        if (pslpi[i].Relationship == RelationCache)
+        size_t last_cache_size = 0;
+
+        for (DWORD i=0; i < nEntries; i++)
         {
-            last_cache_size = max(last_cache_size, pslpi[i].Cache.Size);
-        }             
-    }  
-    cache_size = last_cache_size;
+            if (pslpi[i].Relationship == RelationCache)
+            {
+                last_cache_size = max(last_cache_size, pslpi[i].Cache.Size);
+            }             
+        }  
+        cache_size = last_cache_size;
+    }
 Exit:
 
     if(pslpi)
@@ -1991,6 +1992,9 @@ DWORD GetLogicalCpuCountFromOS()
     
     DWORD nEntries = 0;
 
+    DWORD prevcount = 0;
+    DWORD count = 1;
+
     // Try to use GetLogicalProcessorInformation API and get a valid pointer to the SLPI array if successful.  Returns NULL
     // if API not present or on failure.
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION *pslpi = IsGLPISupported(&nEntries) ;
@@ -2000,9 +2004,6 @@ DWORD GetLogicalCpuCountFromOS()
         // GetLogicalProcessorInformation no supported
         goto lDone;
     }
-
-    DWORD prevcount = 0;
-    DWORD count = 1;
 
     for (DWORD j = 0; j < nEntries; j++)
     {
@@ -2069,16 +2070,9 @@ lDone:
 #define CACHE_PARTITION_BITS    0x003FF000      // number of cache Physical Partitions is returned in EBX[21:12] (10 bits) using cpuid function 4
 #define CACHE_LINESIZE_BITS     0x00000FFF      // Linesize returned in EBX[11:0] (12 bits) using cpuid function 4
 
-#if defined(_TARGET_X86_)
-    // these are defined in cgenx86.cpp
-    extern DWORD getcpuid(DWORD arg1, unsigned char result[16]);
-    extern DWORD getextcpuid(DWORD arg1, DWORD arg2, unsigned char result[16]);
-#elif defined(_TARGET_AMD64_)
-    // these are defined in  src\VM\AMD64\asmhelpers.asm
-    extern "C" DWORD __stdcall getcpuid(DWORD arg1, unsigned char result[16]);
-    extern "C" DWORD __stdcall getextcpuid(DWORD arg1, DWORD arg2, unsigned char result[16]);
-#endif
-
+// these are defined in src\VM\AMD64\asmhelpers.asm / cgenx86.cpp
+extern "C" DWORD __stdcall getcpuid(DWORD arg1, unsigned char result[16]);
+extern "C" DWORD __stdcall getextcpuid(DWORD arg1, DWORD arg2, unsigned char result[16]);
 
 // The following function uses a deterministic mechanism for enumerating/calculating the details of the cache hierarychy at runtime
 // by using deterministic cache parameter leafs on Prescott and higher processors. 
@@ -2497,16 +2491,6 @@ size_t GetLargestOnDieCacheSize(BOOL bTrueSize)
 ThreadLocaleHolder::~ThreadLocaleHolder()
 {
 #ifdef FEATURE_USE_LCID
-#ifdef FEATURE_INCLUDE_ALL_INTERFACES
-    IHostTaskManager *pManager = CorHost2::GetHostTaskManager();
-    if (pManager)
-    {
-        BEGIN_SO_TOLERANT_CODE_CALLING_HOST(GetThread());
-        pManager->SetLocale(m_locale);
-        END_SO_TOLERANT_CODE_CALLING_HOST;
-    }
-    else
-#endif // FEATURE_INCLUDE_ALL_INTERFACES
 #endif // FEATURE_USE_LCID
     {
         SetThreadLocale(m_locale);
@@ -2521,8 +2505,6 @@ HMODULE CLRGetModuleHandle(LPCWSTR lpModuleFileName)
     STATIC_CONTRACT_FORBID_FAULT;
     STATIC_CONTRACT_SO_TOLERANT;
 
-    ThreadAffinityHolder affinity;
-
     HMODULE hMod = WszGetModuleHandle(lpModuleFileName);
     return hMod;
 }
@@ -2536,19 +2518,10 @@ HMODULE CLRGetCurrentModuleHandle()
     STATIC_CONTRACT_FORBID_FAULT;
     STATIC_CONTRACT_SO_TOLERANT;
 
-    ThreadAffinityHolder affinity;
-
     HMODULE hMod = WszGetModuleHandle(NULL);
     return hMod;
 }
 
-#ifndef FEATURE_CORECLR
-static ICLRRuntimeInfo *GetCLRRuntime()
-{
-    LIMITED_METHOD_CONTRACT;
-    return g_pCLRRuntime;
-}
-#endif // !FEATURE_CORECLR
 
 #endif // !FEATURE_PAL
 
@@ -2557,7 +2530,7 @@ extern BOOL EEHeapFreeInProcessHeap(DWORD dwFlags, LPVOID lpMem);
 extern void ShutdownRuntimeWithoutExiting(int exitCode);
 extern BOOL IsRuntimeStarted(DWORD *pdwStartupFlags);
 
-void * GetCLRFunction(LPCSTR FunctionName)
+void * __stdcall GetCLRFunction(LPCSTR FunctionName)
 {
 
     void* func = NULL;
@@ -2573,12 +2546,6 @@ void * GetCLRFunction(LPCSTR FunctionName)
     {
         func = (void*)EEHeapFreeInProcessHeap;
     }
-#ifndef FEATURE_CORECLR
-    else if (strcmp(FunctionName, "GetCLRRuntime") == 0)
-    {
-        func = (void*)GetCLRRuntime;
-    }
-#endif // !FEATURE_CORECLR
     else if (strcmp(FunctionName, "ShutdownRuntimeWithoutExiting") == 0)
     {
         func = (void*)ShutdownRuntimeWithoutExiting;
@@ -2624,19 +2591,6 @@ CLRMapViewOfFileEx(
 
     LPVOID pv = MapViewOfFileEx(hFileMappingObject,dwDesiredAccess,dwFileOffsetHigh,dwFileOffsetLow,dwNumberOfBytesToMap,lpBaseAddress);
 
-#ifdef FEATURE_INCLUDE_ALL_INTERFACES
-    IHostMemoryManager *memoryManager = CorHost2::GetHostMemoryManager();
-    if (pv == NULL && memoryManager)
-    {
-        BEGIN_SO_TOLERANT_CODE_CALLING_HOST(GetThread());
-        if (SUCCEEDED(memoryManager->NeedsVirtualAddressSpace(lpBaseAddress, dwNumberOfBytesToMap)))
-        {
-            // after host releases VA, let us try again.
-            pv = MapViewOfFileEx(hFileMappingObject,dwDesiredAccess,dwFileOffsetHigh,dwFileOffsetLow,dwNumberOfBytesToMap,lpBaseAddress);
-        }
-        END_SO_TOLERANT_CODE_CALLING_HOST;
-    }
-#endif // FEATURE_INCLUDE_ALL_INTERFACES
 
     if (!pv)
     {
@@ -2664,35 +2618,6 @@ CLRMapViewOfFileEx(
 #endif // _TARGET_X86_
 #endif // _DEBUG
     {
-#ifdef FEATURE_INCLUDE_ALL_INTERFACES
-        if (memoryManager)
-        {
-            SIZE_T dwNumberOfBytesMapped = 0;
-            // Find out the size of the whole region.
-            LPVOID lpAddr = pv;
-            MEMORY_BASIC_INFORMATION mbi;
-            while (TRUE)
-            {
-                memset(&mbi, 0, sizeof(mbi));
-#undef VirtualQuery
-                if (!::VirtualQuery(lpAddr, &mbi, sizeof(mbi)))
-                {
-                    break;
-                }
-#define VirtualQuery(lpAddress, lpBuffer, dwLength) \
-    Dont_Use_VirtualQuery(lpAddress, lpBuffer, dwLength)
-                if (mbi.AllocationBase != pv)
-                {
-                    break;
-                }
-                dwNumberOfBytesMapped += mbi.RegionSize;
-                lpAddr = (LPVOID)((BYTE*)lpAddr + mbi.RegionSize);
-            }
-            BEGIN_SO_TOLERANT_CODE_CALLING_HOST(GetThread());
-            memoryManager->AcquiredVirtualAddressSpace(pv, dwNumberOfBytesMapped);
-            END_SO_TOLERANT_CODE_CALLING_HOST;
-        }
-#endif // FEATURE_INCLUDE_ALL_INTERFACES
     }
 
     if (!pv && GetLastError()==ERROR_SUCCESS)
@@ -2735,15 +2660,6 @@ CLRUnmapViewOfFile(
         BOOL result = UnmapViewOfFile(lpBaseAddress);
         if (result)
         {
-#ifdef FEATURE_INCLUDE_ALL_INTERFACES
-            IHostMemoryManager *memoryManager = CorHost2::GetHostMemoryManager();
-            if (memoryManager)
-            {
-                BEGIN_SO_TOLERANT_CODE_CALLING_HOST(GetThread());
-                memoryManager->ReleasedVirtualAddressSpace(lpBaseAddress);
-                END_SO_TOLERANT_CODE_CALLING_HOST;
-            }
-#endif // FEATURE_INCLUDE_ALL_INTERFACES
         }
         return result;
     }
@@ -2760,7 +2676,6 @@ static HMODULE CLRLoadLibraryWorker(LPCWSTR lpLibFileName, DWORD *pLastError)
     STATIC_CONTRACT_FAULT;
     STATIC_CONTRACT_SO_TOLERANT;
 
-    ThreadAffinityHolder affinity;
     HMODULE hMod;
     UINT last = SetErrorMode(SEM_NOOPENFILEERRORBOX|SEM_FAILCRITICALERRORS);
     {
@@ -2804,7 +2719,6 @@ static HMODULE CLRLoadLibraryExWorker(LPCWSTR lpLibFileName, HANDLE hFile, DWORD
     STATIC_CONTRACT_FAULT;
     STATIC_CONTRACT_SO_TOLERANT;
 
-    ThreadAffinityHolder affinity;
     HMODULE hMod;
     UINT last = SetErrorMode(SEM_NOOPENFILEERRORBOX|SEM_FAILCRITICALERRORS);
     {
@@ -2846,7 +2760,6 @@ BOOL CLRFreeLibrary(HMODULE hModule)
     STATIC_CONTRACT_FORBID_FAULT;
     STATIC_CONTRACT_SO_TOLERANT;
 
-    ThreadAffinityHolder affinity;
     return FreeLibrary(hModule);
 }
 
@@ -2857,8 +2770,6 @@ VOID CLRFreeLibraryAndExitThread(HMODULE hModule,DWORD dwExitCode)
     STATIC_CONTRACT_GC_TRIGGERS;
     STATIC_CONTRACT_FORBID_FAULT;
     STATIC_CONTRACT_SO_TOLERANT;
-
-    ThreadAffinityHolder affinity;
 
     // This is no-return
     FreeLibraryAndExitThread(hModule,dwExitCode);

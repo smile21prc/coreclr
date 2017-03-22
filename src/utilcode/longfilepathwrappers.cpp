@@ -19,8 +19,8 @@ private:
         static const WCHAR VolumeSeparatorChar;
 		#define UNCPATHPREFIX W("\\\\")
 #endif //FEATURE_PAL
-        static const WCHAR LongFile::DirectorySeparatorChar;
-        static const WCHAR LongFile::AltDirectorySeparatorChar;
+        static const WCHAR DirectorySeparatorChar;
+        static const WCHAR AltDirectorySeparatorChar;
 public:
         static BOOL IsExtended(SString & path);
         static BOOL IsUNCExtended(SString & path);
@@ -1187,7 +1187,6 @@ FindFirstFileExWrapper(
 }
 #endif //!FEATURE_PAL
 
-#if defined(FEATURE_CORECLR) || defined(CROSSGEN_COMPILE)
 
 #ifndef FEATURE_PAL
 
@@ -1247,7 +1246,6 @@ BOOL PAL_GetPALDirectoryWrapper(SString& pbuffer)
 
 #endif // FEATURE_PAL
 
-#endif // FEATURE_CORECLR || CROSSGEN_COMPILE
 
 //Implementation of LongFile Helpers
 const WCHAR LongFile::DirectorySeparatorChar = W('\\');

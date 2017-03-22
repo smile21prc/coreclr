@@ -43,7 +43,6 @@
 #cmakedefine01 HAVE_LOCALTIME_R
 #cmakedefine01 HAVE_GMTIME_R
 #cmakedefine01 HAVE_TIMEGM
-#cmakedefine01 HAVE__SNWPRINTF
 #cmakedefine01 HAVE_POLL
 #cmakedefine01 HAVE_STATVFS
 #cmakedefine01 HAVE_THREAD_SELF
@@ -52,6 +51,7 @@
 #cmakedefine01 HAVE_MACH_EXCEPTIONS
 #cmakedefine01 HAVE_VM_ALLOCATE
 #cmakedefine01 HAVE_VM_READ
+#cmakedefine01 HAVE_SEMAPHORE_H
 #cmakedefine01 HAS_SYSV_SEMAPHORES
 #cmakedefine01 HAS_PTHREAD_MUTEXES
 #cmakedefine01 HAVE_TTRACE

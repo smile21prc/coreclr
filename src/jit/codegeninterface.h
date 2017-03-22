@@ -191,7 +191,7 @@ public:
     int genSPtoFPdelta();
     int genTotalFrameSize();
 
-    regNumber genGetThisArgReg(GenTreePtr call);
+    regNumber genGetThisArgReg(GenTreeCall* call) const;
 
 #ifdef _TARGET_XARCH_
 #ifdef _TARGET_AMD64_
@@ -426,10 +426,8 @@ public:
 private:
     bool m_cgFullPtrRegMap;
 
-#ifdef DEBUGGING_SUPPORT
 public:
     virtual void siUpdate() = 0;
-#endif // DEBUGGING_SUPPORT
 
 #ifdef LATE_DISASM
 public:

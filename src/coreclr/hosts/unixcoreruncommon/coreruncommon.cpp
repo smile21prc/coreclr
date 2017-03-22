@@ -313,6 +313,7 @@ int ExecuteManagedAssembly(
     std::string appPath;
     GetDirectory(managedAssemblyAbsolutePath, appPath);
 
+    std::string tpaList;
     // Construct native search directory paths
     std::string nativeDllSearchDirs(appPath);
     char *coreLibraries = getenv("CORE_LIBRARIES");
@@ -320,11 +321,14 @@ int ExecuteManagedAssembly(
     {
         nativeDllSearchDirs.append(":");
         nativeDllSearchDirs.append(coreLibraries);
+        if (std::strcmp(coreLibraries, clrFilesAbsolutePath) != 0)
+        {
+            AddFilesFromDirectoryToTpaList(coreLibraries, tpaList);
+        }
     }
     nativeDllSearchDirs.append(":");
     nativeDllSearchDirs.append(clrFilesAbsolutePath);
 
-    std::string tpaList;
     AddFilesFromDirectoryToTpaList(clrFilesAbsolutePath, tpaList);
 
     void* coreclrLib = dlopen(coreClrDllPath.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -379,7 +383,6 @@ int ExecuteManagedAssembly(
                 "APP_PATHS",
                 "APP_NI_PATHS",
                 "NATIVE_DLL_SEARCH_DIRECTORIES",
-                "AppDomainCompatSwitch",
                 "System.GC.Server",
             };
             const char *propertyValues[] = {
@@ -391,8 +394,6 @@ int ExecuteManagedAssembly(
                 appPath.c_str(),
                 // NATIVE_DLL_SEARCH_DIRECTORIES
                 nativeDllSearchDirs.c_str(),
-                // AppDomainCompatSwitch
-                "UseLatestBehaviorWhenTFMNotSpecified",
                 // System.GC.Server
                 useServerGc,
             };
@@ -446,7 +447,7 @@ int ExecuteManagedAssembly(
     }
     else
     {
-        char* error = dlerror();
+        const char* error = dlerror();
         fprintf(stderr, "dlopen failed to open the libcoreclr.so with error %s\n", error);
     }
 

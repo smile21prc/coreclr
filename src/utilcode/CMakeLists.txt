@@ -28,7 +28,6 @@ set(UTILCODE_COMMON_SOURCES
   peinformation.cpp
   check.cpp
   log.cpp
-  apithreadstress.cpp
   arraylist.cpp
   bitvector.cpp
   comex.cpp
@@ -41,7 +40,6 @@ set(UTILCODE_COMMON_SOURCES
   outstring.cpp
   ilformatter.cpp
   opinfo.cpp
-  dacutil.cpp
   sortversioning.cpp
   corimage.cpp
   format1.cpp
@@ -71,6 +69,7 @@ set(UTILCODE_COMMON_SOURCES
 if(WIN32)
   list(APPEND UTILCODE_COMMON_SOURCES 
     appxutil.cpp
+    dacutil.cpp
     dlwrap.cpp
     downlevel.cpp
     loadrc.cpp

@@ -2,34 +2,27 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
-/*=============================================================================
-**
-**
-** 
-**
-**
-** Purpose: go from type to type info
-**
-**
-=============================================================================*/
+using System.Diagnostics;
 
 namespace System.Reflection
 {
-    using System.Reflection;
-
     public static class IntrospectionExtensions
     {
-	    public static TypeInfo GetTypeInfo(this Type type){
-            if(type == null){
-                throw new ArgumentNullException("type");
-            }
-            var rcType=(IReflectableType)type;
-            if(rcType==null){
-                return null;
-            }else{
-                return rcType.GetTypeInfo();
-            }
-        }   
+        public static TypeInfo GetTypeInfo(this Type type)
+        {
+            IReflectableType reflectableType = type as IReflectableType;
+            if (reflectableType != null)
+                return reflectableType.GetTypeInfo();
+
+            if (type == null)
+                throw new ArgumentNullException(nameof(type));
+
+            // This is bizarre but compatible with the desktop which casts "type" to IReflectableType without checking and
+            // thus, throws an InvalidCastException.
+            object ignore = (IReflectableType)type;
+            Debug.Fail("Did not expect to get here.");
+            throw new InvalidOperationException();
+        }
     }
 }
 

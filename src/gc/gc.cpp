@@ -21,22 +21,6 @@
 
 #define USE_INTROSORT
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-inline BOOL ShouldTrackMovementForProfilerOrEtw()
-{
-#ifdef GC_PROFILING
-    if (CORProfilerTrackGC())
-        return true;
-#endif
-
-#ifdef FEATURE_EVENT_TRACE
-    if (ETW::GCLog::ShouldTrackMovementForEtw())
-        return true;
-#endif
-
-    return false;
-}
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 
 #if defined(BACKGROUND_GC) && defined(FEATURE_EVENT_TRACE)
 BOOL bgc_heap_walk_for_etw_p = FALSE;
@@ -84,6 +68,24 @@ int compact_ratio = 0;
 // See comments in reset_memory.
 BOOL reset_mm_p = TRUE;
 
+bool g_fFinalizerRunOnShutDown = false;
+
+#ifdef FEATURE_SVR_GC
+bool g_built_with_svr_gc = true;
+#else
+bool g_built_with_svr_gc = false;
+#endif // FEATURE_SVR_GC
+
+#if defined(BUILDENV_DEBUG)
+uint8_t g_build_variant = 0;
+#elif defined(BUILDENV_CHECKED)
+uint8_t g_build_variant = 1;
+#else
+uint8_t g_build_variant = 2;
+#endif // defined(BUILDENV_DEBUG)
+
+VOLATILE(int32_t) g_no_gc_lock = -1;
+
 #if defined (TRACE_GC) && !defined (DACCESS_COMPILE)
 const char * const allocation_state_str[] = {
     "start",
@@ -108,7 +110,6 @@ const char * const allocation_state_str[] = {
     "check_retry_seg"
 };
 #endif //TRACE_GC && !DACCESS_COMPILE
-
 
 // Keep this in sync with the definition of gc_reason
 #if (defined(DT_LOG) || defined(TRACE_GC)) && !defined (DACCESS_COMPILE)
@@ -165,6 +166,7 @@ size_t GetHighPrecisionTimeStamp()
     return (size_t)(ts / (qpf / 1000));    
 }
 #endif
+
 
 #ifdef GC_STATS
 // There is a current and a prior copy of the statistics.  This allows us to display deltas per reporting
@@ -349,8 +351,8 @@ void gc_heap::add_to_history_per_heap()
 #endif //BACKGROUND_GC
     current_hist->fgc_lowest = lowest_address;
     current_hist->fgc_highest = highest_address;
-    current_hist->g_lowest = g_lowest_address;
-    current_hist->g_highest = g_highest_address;
+    current_hist->g_lowest = g_gc_lowest_address;
+    current_hist->g_highest = g_gc_highest_address;
 
     gchist_index_per_heap++;
     if (gchist_index_per_heap == max_history_count)
@@ -405,7 +407,7 @@ void log_va_msg(const char *fmt, va_list args)
     int pid_len = sprintf_s (&pBuffer[buffer_start], BUFFERSIZE - buffer_start, "[%5d]", (uint32_t)GCToOSInterface::GetCurrentThreadIdForLogging());
     buffer_start += pid_len;
     memset(&pBuffer[buffer_start], '-', BUFFERSIZE - buffer_start);
-    int msg_len = _vsnprintf(&pBuffer[buffer_start], BUFFERSIZE - buffer_start, fmt, args );
+    int msg_len = _vsnprintf_s(&pBuffer[buffer_start], BUFFERSIZE - buffer_start, _TRUNCATE, fmt, args );
     if (msg_len == -1)
     {
         msg_len = BUFFERSIZE - buffer_start;
@@ -1418,9 +1420,6 @@ int mark_time, plan_time, sweep_time, reloc_time, compact_time;
 
 #ifndef MULTIPLE_HEAPS
 
-#define ephemeral_low           g_ephemeral_low
-#define ephemeral_high          g_ephemeral_high
-
 #endif // MULTIPLE_HEAPS
 
 #ifdef TRACE_GC
@@ -1477,7 +1476,11 @@ inline bool can_use_write_watch_for_gc_heap()
 
 inline bool can_use_write_watch_for_card_table()
 {
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    return true;
+#else
     return can_use_hardware_write_watch();
+#endif
 }
 
 #else
@@ -2180,17 +2183,63 @@ size_t logcount (size_t word)
     return count;
 }
 
-//n!=0
-int log2(unsigned int n) 
+#ifndef DACCESS_COMPILE
+
+void stomp_write_barrier_resize(bool is_runtime_suspended, bool requires_upper_bounds_check)
 {
-    int pos = 0;
-    if (n >= 1<<16) { n >>= 16; pos += 16; }
-    if (n >= 1<< 8) { n >>=  8; pos +=  8; }
-    if (n >= 1<< 4) { n >>=  4; pos +=  4; }
-    if (n >= 1<< 2) { n >>=  2; pos +=  2; }
-    if (n >= 1<< 1) {           pos +=  1; }
-    return pos;
+    WriteBarrierParameters args = {};
+    args.operation = WriteBarrierOp::StompResize;
+    args.is_runtime_suspended = is_runtime_suspended;
+    args.requires_upper_bounds_check = requires_upper_bounds_check;
+
+    args.card_table = g_gc_card_table;
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    args.card_bundle_table = g_gc_card_bundle_table;
+#endif
+
+    args.lowest_address = g_gc_lowest_address;
+    args.highest_address = g_gc_highest_address;
+
+#ifdef FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
+    if (SoftwareWriteWatch::IsEnabledForGCHeap())
+    {
+        args.write_watch_table = g_gc_sw_ww_table;
+    }
+#endif // FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
+
+    GCToEEInterface::StompWriteBarrier(&args);
 }
+
+void stomp_write_barrier_ephemeral(uint8_t* ephemeral_low, uint8_t* ephemeral_high)
+{
+    WriteBarrierParameters args = {};
+    args.operation = WriteBarrierOp::StompEphemeral;
+    args.is_runtime_suspended = true;
+    args.ephemeral_low = ephemeral_low;
+    args.ephemeral_high = ephemeral_high;
+    GCToEEInterface::StompWriteBarrier(&args);
+}
+
+void stomp_write_barrier_initialize()
+{
+    WriteBarrierParameters args = {};
+    args.operation = WriteBarrierOp::Initialize;
+    args.is_runtime_suspended = true;
+    args.requires_upper_bounds_check = false;
+    args.card_table = g_gc_card_table;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    args.card_bundle_table = g_gc_card_bundle_table;
+#endif
+    
+    args.lowest_address = g_gc_lowest_address;
+    args.highest_address = g_gc_highest_address;
+    args.ephemeral_low = reinterpret_cast<uint8_t*>(1);
+    args.ephemeral_high = reinterpret_cast<uint8_t*>(~0);
+    GCToEEInterface::StompWriteBarrier(&args);
+}
+
+#endif // DACCESS_COMPILE
 
 //extract the low bits [0,low[ of a uint32_t
 #define lowbits(wrd, bits) ((wrd) & ((1 << (bits))-1))
@@ -2230,8 +2279,8 @@ void virtual_free (void* add, size_t size);
 /* per heap static initialization */
 #ifdef MARK_ARRAY
 #ifndef MULTIPLE_HEAPS
-SPTR_IMPL_NS(uint32_t, WKS, gc_heap, mark_array);
-#endif //!MULTIPLE_HEAPS
+uint32_t*   gc_heap::mark_array;
+#endif //MULTIPLE_HEAPS
 #endif //MARK_ARRAY
 
 #ifdef MARK_LIST
@@ -2265,8 +2314,9 @@ CLREvent    gc_heap::gc_start_event;
 
 bool        gc_heap::gc_thread_no_affinitize_p = false;
 
-SVAL_IMPL_NS(int, SVR, gc_heap, n_heaps);
-SPTR_IMPL_NS(PTR_gc_heap, SVR, gc_heap, g_heaps);
+int         gc_heap::n_heaps;
+
+gc_heap**   gc_heap::g_heaps;
 
 size_t*     gc_heap::g_promoted;
 
@@ -2357,11 +2407,7 @@ size_t      gc_heap::ephemeral_fgc_counts[max_generation];
 
 BOOL        gc_heap::alloc_wait_event_p = FALSE;
 
-#if defined (DACCESS_COMPILE) && !defined (MULTIPLE_HEAPS)
-SVAL_IMPL_NS_INIT(gc_heap::c_gc_state, WKS, gc_heap, current_c_gc_state, c_gc_state_free);
-#else
-VOLATILE(gc_heap::c_gc_state) gc_heap::current_c_gc_state = c_gc_state_free;
-#endif //DACCESS_COMPILE && !MULTIPLE_HEAPS
+VOLATILE(c_gc_state) gc_heap::current_c_gc_state = c_gc_state_free;
 
 #endif //BACKGROUND_GC
 
@@ -2382,20 +2428,24 @@ BOOL        gc_heap::elevation_requested = FALSE;
 BOOL        gc_heap::last_gc_before_oom = FALSE;
 
 #ifdef BACKGROUND_GC
-SPTR_IMPL_NS_INIT(uint8_t, WKS, gc_heap, background_saved_lowest_address, 0);
-SPTR_IMPL_NS_INIT(uint8_t, WKS, gc_heap, background_saved_highest_address, 0);
-SPTR_IMPL_NS_INIT(uint8_t, WKS, gc_heap, next_sweep_obj, 0);
+uint8_t*    gc_heap::background_saved_lowest_address = 0;
+uint8_t*    gc_heap::background_saved_highest_address = 0;
+uint8_t*    gc_heap::next_sweep_obj = 0;
 uint8_t*    gc_heap::current_sweep_pos = 0;
 exclusive_sync* gc_heap::bgc_alloc_lock;
 #endif //BACKGROUND_GC
 
-SVAL_IMPL_NS(oom_history, WKS, gc_heap, oom_info);
+oom_history gc_heap::oom_info;
 
 fgm_history gc_heap::fgm_result;
 
 BOOL        gc_heap::ro_segments_in_range;
 
 size_t      gc_heap::gen0_big_free_spaces = 0;
+
+uint8_t*    gc_heap::ephemeral_low;
+
+uint8_t*    gc_heap::ephemeral_high;
 
 uint8_t*    gc_heap::lowest_address;
 
@@ -2436,7 +2486,7 @@ size_t      gc_heap::allocation_running_time;
 
 size_t      gc_heap::allocation_running_amount;
 
-SPTR_IMPL_NS_INIT(heap_segment, WKS, gc_heap, ephemeral_heap_segment, 0);
+heap_segment* gc_heap::ephemeral_heap_segment = 0;
 
 BOOL        gc_heap::blocking_collection = FALSE;
 
@@ -2511,8 +2561,9 @@ uint8_t*    gc_heap::background_min_soh_overflow_address =0;
 
 uint8_t*    gc_heap::background_max_soh_overflow_address =0;
 
-SPTR_IMPL_NS_INIT(heap_segment, WKS, gc_heap, saved_sweep_ephemeral_seg, 0);
-SPTR_IMPL_NS_INIT(uint8_t, WKS, gc_heap, saved_sweep_ephemeral_start, 0);
+heap_segment* gc_heap::saved_sweep_ephemeral_seg = 0;
+
+uint8_t*    gc_heap::saved_sweep_ephemeral_start = 0;
 
 heap_segment* gc_heap::saved_overflow_ephemeral_seg = 0;
 
@@ -2588,9 +2639,11 @@ size_t      gc_heap::total_ephemeral_size = 0;
 
 size_t      gc_heap::internal_root_array_length = initial_internal_roots;
 
-SPTR_IMPL_NS_INIT(PTR_uint8_t, WKS, gc_heap, internal_root_array, 0);
-SVAL_IMPL_NS_INIT(size_t, WKS, gc_heap, internal_root_array_index, 0);
-SVAL_IMPL_NS_INIT(BOOL, WKS, gc_heap, heap_analyze_success, TRUE);
+uint8_t**   gc_heap::internal_root_array = 0;
+
+size_t      gc_heap::internal_root_array_index = 0;
+
+BOOL        gc_heap::heap_analyze_success = TRUE;
 
 uint8_t*    gc_heap::current_obj = 0;
 size_t      gc_heap::current_obj_size = 0;
@@ -2650,24 +2703,6 @@ BOOL        gc_heap::heap_analyze_enabled = FALSE;
 
 #ifndef MULTIPLE_HEAPS
 
-#ifndef DACCESS_COMPILE
-extern "C" {
-#endif //!DACCESS_COMPILE
-GARY_IMPL(generation, generation_table,NUMBERGENERATIONS+1);
-#ifdef GC_CONFIG_DRIVEN
-GARY_IMPL(size_t, interesting_data_per_heap, max_idp_count);
-GARY_IMPL(size_t, compact_reasons_per_heap, max_compact_reasons_count);
-GARY_IMPL(size_t, expand_mechanisms_per_heap, max_expand_mechanisms_count);
-GARY_IMPL(size_t, interesting_mechanism_bits_per_heap, max_gc_mechanism_bits_count);
-#endif //GC_CONFIG_DRIVEN
-#ifndef DACCESS_COMPILE
-}
-#endif //!DACCESS_COMPILE
-
-#endif //MULTIPLE_HEAPS
-
-#ifndef MULTIPLE_HEAPS
-
 alloc_list gc_heap::loh_alloc_list [NUM_LOH_ALIST-1];
 alloc_list gc_heap::gen2_alloc_list[NUM_GEN2_ALIST-1];
 
@@ -2675,7 +2710,7 @@ dynamic_data gc_heap::dynamic_data_table [NUMBERGENERATIONS+1];
 gc_history_per_heap gc_heap::gc_data_per_heap;
 size_t gc_heap::maxgen_pinned_compact_before_advance = 0;
 
-SPTR_IMPL_NS_INIT(uint8_t, WKS, gc_heap, alloc_allocated, 0);
+uint8_t* gc_heap::alloc_allocated = 0;
 
 size_t gc_heap::allocation_quantum = CLR_SIZE;
 
@@ -2693,6 +2728,7 @@ unsigned int gc_heap::num_low_msl_acquire = 0;
 size_t   gc_heap::alloc_contexts_used = 0;
 size_t   gc_heap::soh_allocation_no_gc = 0;
 size_t   gc_heap::loh_allocation_no_gc = 0;
+bool     gc_heap::no_gc_oom_p = false;
 heap_segment* gc_heap::saved_loh_segment_no_gc = 0;
 
 #endif //MULTIPLE_HEAPS
@@ -2706,8 +2742,18 @@ int         gc_heap::gen0_must_clear_bricks = 0;
 #endif //FFIND_OBJECT
 
 #ifdef FEATURE_PREMORTEM_FINALIZATION
-SPTR_IMPL_NS_INIT(CFinalize, WKS, gc_heap, finalize_queue, 0);
+CFinalize*  gc_heap::finalize_queue = 0;
 #endif // FEATURE_PREMORTEM_FINALIZATION
+
+generation gc_heap::generation_table [NUMBERGENERATIONS + 1];
+
+size_t     gc_heap::interesting_data_per_heap[max_idp_count];
+
+size_t     gc_heap::compact_reasons_per_heap[max_compact_reasons_count];
+
+size_t     gc_heap::expand_mechanisms_per_heap[max_expand_mechanisms_count];
+
+size_t     gc_heap::interesting_mechanism_bits_per_heap[max_gc_mechanism_bits_count];
 
 #endif // MULTIPLE_HEAPS
 
@@ -3422,7 +3468,7 @@ inline
 size_t ro_seg_begin_index (heap_segment* seg)
 {
     size_t begin_index = (size_t)seg / gc_heap::min_segment_size;
-    begin_index = max (begin_index, (size_t)g_lowest_address / gc_heap::min_segment_size);
+    begin_index = max (begin_index, (size_t)g_gc_lowest_address / gc_heap::min_segment_size);
     return begin_index;
 }
 
@@ -3430,14 +3476,14 @@ inline
 size_t ro_seg_end_index (heap_segment* seg)
 {
     size_t end_index = (size_t)(heap_segment_reserved (seg) - 1) / gc_heap::min_segment_size;
-    end_index = min (end_index, (size_t)g_highest_address / gc_heap::min_segment_size);
+    end_index = min (end_index, (size_t)g_gc_highest_address / gc_heap::min_segment_size);
     return end_index;
 }
 
 void seg_mapping_table_add_ro_segment (heap_segment* seg)
 {
 #ifdef GROWABLE_SEG_MAPPING_TABLE
-    if ((heap_segment_reserved (seg) <= g_lowest_address) || (heap_segment_mem (seg) >= g_highest_address))
+    if ((heap_segment_reserved (seg) <= g_gc_lowest_address) || (heap_segment_mem (seg) >= g_gc_highest_address))
         return;
 #endif //GROWABLE_SEG_MAPPING_TABLE
 
@@ -3621,7 +3667,7 @@ gc_heap* seg_mapping_table_heap_of_worker (uint8_t* o)
 gc_heap* seg_mapping_table_heap_of (uint8_t* o)
 {
 #ifdef GROWABLE_SEG_MAPPING_TABLE
-    if ((o < g_lowest_address) || (o >= g_highest_address))
+    if ((o < g_gc_lowest_address) || (o >= g_gc_highest_address))
         return 0;
 #endif //GROWABLE_SEG_MAPPING_TABLE
 
@@ -3631,7 +3677,7 @@ gc_heap* seg_mapping_table_heap_of (uint8_t* o)
 gc_heap* seg_mapping_table_heap_of_gc (uint8_t* o)
 {
 #if defined(FEATURE_BASICFREEZE) && defined(GROWABLE_SEG_MAPPING_TABLE)
-    if ((o < g_lowest_address) || (o >= g_highest_address))
+    if ((o < g_gc_lowest_address) || (o >= g_gc_highest_address))
         return 0;
 #endif //FEATURE_BASICFREEZE || GROWABLE_SEG_MAPPING_TABLE
 
@@ -3643,7 +3689,7 @@ gc_heap* seg_mapping_table_heap_of_gc (uint8_t* o)
 heap_segment* seg_mapping_table_segment_of (uint8_t* o)
 {
 #if defined(FEATURE_BASICFREEZE) && defined(GROWABLE_SEG_MAPPING_TABLE)
-    if ((o < g_lowest_address) || (o >= g_highest_address))
+    if ((o < g_gc_lowest_address) || (o >= g_gc_highest_address))
 #ifdef FEATURE_BASICFREEZE
         return ro_segment_lookup (o);
 #else
@@ -3666,8 +3712,6 @@ heap_segment* seg_mapping_table_segment_of (uint8_t* o)
 
     if (seg)
     {
-        // Can't assert this when it's callled by everyone (it's true when it's called by mark cards).
-        //assert (in_range_for_segment (o, seg));
         if (in_range_for_segment (o, seg))
         {
             dprintf (2, ("obj %Ix belongs to segment %Ix(-%Ix)", o, (uint8_t*)heap_segment_mem(seg), (uint8_t*)heap_segment_reserved(seg)));
@@ -3686,7 +3730,7 @@ heap_segment* seg_mapping_table_segment_of (uint8_t* o)
 
 #ifdef FEATURE_BASICFREEZE
     // TODO: This was originally written assuming that the seg_mapping_table would always contain entries for ro 
-    // segments whenever the ro segment falls into the [g_lowest_address,g_highest_address) range.  I.e., it had an 
+    // segments whenever the ro segment falls into the [g_gc_lowest_address,g_gc_highest_address) range.  I.e., it had an 
     // extra "&& (size_t)(entry->seg1) & ro_in_entry" expression.  However, at the moment, grow_brick_card_table does 
     // not correctly go through the ro segments and add them back to the seg_mapping_table when the [lowest,highest) 
     // range changes.  We should probably go ahead and modify grow_brick_card_table and put back the 
@@ -3704,7 +3748,6 @@ heap_segment* seg_mapping_table_segment_of (uint8_t* o)
 #endif //SEG_MAPPING_TABLE
 
 size_t gcard_of ( uint8_t*);
-void gset_card (size_t card);
 
 #define memref(i) *(uint8_t**)(i)
 
@@ -4086,8 +4129,8 @@ BOOL reserve_initial_memory (size_t normal_size, size_t large_size, size_t num_h
     memory_details.current_block_normal = 0;
     memory_details.current_block_large = 0;
 
-    g_lowest_address = MAX_PTR;
-    g_highest_address = 0;
+    g_gc_lowest_address = MAX_PTR;
+    g_gc_highest_address = 0;
 
     if (((size_t)MAX_PTR - large_size) < normal_size)
     {
@@ -4107,8 +4150,8 @@ BOOL reserve_initial_memory (size_t normal_size, size_t large_size, size_t num_h
     uint8_t* allatonce_block = (uint8_t*)virtual_alloc (requestedMemory);
     if (allatonce_block)
     {
-        g_lowest_address =  allatonce_block;
-        g_highest_address = allatonce_block + (memory_details.block_count * (large_size + normal_size));
+        g_gc_lowest_address =  allatonce_block;
+        g_gc_highest_address = allatonce_block + (memory_details.block_count * (large_size + normal_size));
         memory_details.allocation_pattern = initial_memory_details::ALLATONCE;
 
         for(size_t i = 0; i < memory_details.block_count; i++)
@@ -4131,8 +4174,8 @@ BOOL reserve_initial_memory (size_t normal_size, size_t large_size, size_t num_h
             if (b2)
             {
                 memory_details.allocation_pattern = initial_memory_details::TWO_STAGE;
-                g_lowest_address = min(b1,b2);
-                g_highest_address = max(b1 + memory_details.block_count*normal_size,
+                g_gc_lowest_address = min(b1,b2);
+                g_gc_highest_address = max(b1 + memory_details.block_count*normal_size,
                                         b2 + memory_details.block_count*large_size);
                 for(size_t i = 0; i < memory_details.block_count; i++)
                 {
@@ -4178,10 +4221,10 @@ BOOL reserve_initial_memory (size_t normal_size, size_t large_size, size_t num_h
                 }
                 else
                 {
-                    if (current_block->memory_base < g_lowest_address)
-                        g_lowest_address =  current_block->memory_base;
-                    if (((uint8_t *) current_block->memory_base + block_size) > g_highest_address)
-                        g_highest_address = (current_block->memory_base + block_size);
+                    if (current_block->memory_base < g_gc_lowest_address)
+                        g_gc_lowest_address =  current_block->memory_base;
+                    if (((uint8_t *) current_block->memory_base + block_size) > g_gc_highest_address)
+                        g_gc_highest_address = (current_block->memory_base + block_size);
                 }
                 reserve_success = TRUE;
             }
@@ -4288,7 +4331,7 @@ void* virtual_alloc (size_t size)
         flags = VirtualReserveFlags::WriteWatch;
     }
 #endif // !FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
-    void* prgmem = GCToOSInterface::VirtualReserve (0, requested_size, card_size * card_word_width, flags);
+    void* prgmem = GCToOSInterface::VirtualReserve (requested_size, card_size * card_word_width, flags);
     void *aligned_mem = prgmem;
 
     // We don't want (prgmem + size) to be right at the end of the address space 
@@ -4623,22 +4666,22 @@ gc_heap::get_segment (size_t size, BOOL loh_p)
         {
             uint8_t* start;
             uint8_t* end;
-            if (mem < g_lowest_address)
+            if (mem < g_gc_lowest_address)
             {
                 start =  (uint8_t*)mem;
             }
             else
             {
-                start = (uint8_t*)g_lowest_address;
+                start = (uint8_t*)g_gc_lowest_address;
             }
 
-            if (((uint8_t*)mem + size) > g_highest_address)
+            if (((uint8_t*)mem + size) > g_gc_highest_address)
             {
                 end = (uint8_t*)mem + size;
             }
             else
             {
-                end = (uint8_t*)g_highest_address;
+                end = (uint8_t*)g_gc_highest_address;
             }
 
             if (gc_heap::grow_brick_card_tables (start, end, size, result, __this, loh_p) != 0)
@@ -4703,10 +4746,7 @@ heap_segment* gc_heap::get_segment_for_loh (size_t size
 
         FireEtwGCCreateSegment_V1((size_t)heap_segment_mem(res), (size_t)(heap_segment_reserved (res) - heap_segment_mem(res)), ETW::GCLog::ETW_GC_INFO::LARGE_OBJECT_HEAP, GetClrInstanceId());
 
-#ifdef GC_PROFILING
-        if (CORProfilerTrackGC())
-            UpdateGenerationBounds();
-#endif // GC_PROFILING
+        GCToEEInterface::DiagUpdateGenerationBounds();
 
 #ifdef MULTIPLE_HEAPS
         hp->thread_loh_segment (res);
@@ -5198,9 +5238,9 @@ bool gc_heap::create_gc_thread ()
 #if !defined(FEATURE_PAL)
     if (!gc_thread_no_affinitize_p)
     {
-        //We are about to set affinity for GC threads, it is a good place to setup NUMA and
-        //CPU groups, because the process mask, processor number, group number are all
-        //readyly available.
+        // We are about to set affinity for GC threads. It is a good place to set up NUMA and
+        // CPU groups because the process mask, processor number, and group number are all
+        // readily available.
         if (CPUGroupInfo::CanEnableGCCPUGroups()) 
             set_thread_group_affinity_for_heap(heap_number, &affinity);
         else
@@ -5314,7 +5354,9 @@ bool virtual_alloc_commit_for_heap(void* addr, size_t size, int h_number)
 #if defined(MULTIPLE_HEAPS) && !defined(FEATURE_REDHAWK) && !defined(FEATURE_PAL)
     // Currently there is no way for us to specific the numa node to allocate on via hosting interfaces to
     // a host. This will need to be added later.
+#if !defined(FEATURE_CORECLR)
     if (!CLRMemoryHosted())
+#endif
     {
         if (NumaNodeInfo::CanEnableGCNumaAware())
         {
@@ -5340,7 +5382,7 @@ heap_segment* gc_heap::segment_of (uint8_t* add, ptrdiff_t& delta, BOOL verify_p
     uint8_t* sadd = add;
     heap_segment* hs = 0;
     heap_segment* hs1 = 0;
-    if (!((add >= g_lowest_address) && (add < g_highest_address)))
+    if (!((add >= g_gc_lowest_address) && (add < g_gc_highest_address)))
     {
         delta = 0;
         return 0;
@@ -5523,7 +5565,6 @@ public:
         saved_post_plug_reloc = temp;
     }
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
     void swap_pre_plug_and_saved_for_profiler()
     {
         gap_reloc_pair temp;
@@ -5539,7 +5580,6 @@ public:
         memcpy (saved_post_plug_info_start, &saved_post_plug, sizeof (saved_post_plug));
         saved_post_plug = temp;
     }
-#endif //GC_PROFILING || //FEATURE_EVENT_TRACE
 
     // We should think about whether it's really necessary to have to copy back the pre plug
     // info since it was already copied during compacting plugs. But if a plug doesn't move
@@ -5688,18 +5728,13 @@ void gc_mechanisms::record (gc_history_global* history)
 //as opposed to concurrent heap verification
 void gc_heap::fix_youngest_allocation_area (BOOL for_gc_p)
 {
-    assert (alloc_allocated);
-    alloc_context* acontext = generation_alloc_context (youngest_generation);
-    dprintf (3, ("generation 0 alloc context: ptr: %Ix, limit %Ix",
-                 (size_t)acontext->alloc_ptr, (size_t)acontext->alloc_limit));
-    fix_allocation_context (acontext, for_gc_p, get_alignment_constant (TRUE));
-    if (for_gc_p)
-    {
-        acontext->alloc_ptr = alloc_allocated;
-        acontext->alloc_limit = acontext->alloc_ptr;
-    }
-    heap_segment_allocated (ephemeral_heap_segment) =
-        alloc_allocated;
+    UNREFERENCED_PARAMETER(for_gc_p);
+
+    // The gen 0 alloc context is never used for allocation in the allocator path. It's
+    // still used in the allocation path during GCs.
+    assert (generation_allocation_pointer (youngest_generation) == nullptr);
+    assert (generation_allocation_limit (youngest_generation) == nullptr);
+    heap_segment_allocated (ephemeral_heap_segment) = alloc_allocated;
 }
 
 void gc_heap::fix_large_allocation_area (BOOL for_gc_p)
@@ -5765,9 +5800,10 @@ void gc_heap::fix_allocation_context (alloc_context* acontext, BOOL for_gc_p,
         alloc_contexts_used ++;
     }
 
-
     if (for_gc_p)
     {
+        // We need to update the alloc_bytes to reflect the portion that we have not used  
+        acontext->alloc_bytes -= (acontext->alloc_limit - acontext->alloc_ptr);  
         acontext->alloc_ptr = 0;
         acontext->alloc_limit = acontext->alloc_ptr;
     }
@@ -5804,12 +5840,6 @@ void void_allocation (gc_alloc_context* acontext, void*)
 void gc_heap::repair_allocation_contexts (BOOL repair_p)
 {
     GCToEEInterface::GcEnumAllocContexts (repair_p ? repair_allocation : void_allocation, NULL);
-
-    alloc_context* acontext = generation_alloc_context (youngest_generation);
-    if (repair_p)
-        repair_allocation (acontext, NULL);
-    else
-        void_allocation (acontext, NULL);
 }
 
 struct fix_alloc_context_args
@@ -5829,8 +5859,8 @@ void gc_heap::fix_allocation_contexts(BOOL for_gc_p)
     fix_alloc_context_args args;
     args.for_gc_p = for_gc_p;
     args.heap = __this;
-    GCToEEInterface::GcEnumAllocContexts(fix_alloc_context, &args);
 
+    GCToEEInterface::GcEnumAllocContexts(fix_alloc_context, &args);
     fix_youngest_allocation_area(for_gc_p);
     fix_large_allocation_area(for_gc_p);
 }
@@ -6263,6 +6293,150 @@ void gc_heap::make_c_mark_list (uint8_t** arr)
 }
 #endif //BACKGROUND_GC
 
+
+#ifdef CARD_BUNDLE
+
+// The card bundle keeps track of groups of card words.
+static const size_t card_bundle_word_width = 32;
+
+// How do we express the fact that 32 bits (card_word_width) is one uint32_t?
+static const size_t card_bundle_size = (size_t)(OS_PAGE_SIZE / (sizeof(uint32_t)*card_bundle_word_width));
+
+inline
+size_t card_bundle_word (size_t cardb)
+{
+    return cardb / card_bundle_word_width;
+}
+
+inline
+uint32_t card_bundle_bit (size_t cardb)
+{
+    return (uint32_t)(cardb % card_bundle_word_width);
+}
+
+size_t align_cardw_on_bundle (size_t cardw)
+{
+    return ((size_t)(cardw + card_bundle_size - 1) & ~(card_bundle_size - 1 ));
+}
+
+// Get the card bundle representing a card word
+size_t cardw_card_bundle (size_t cardw)
+{
+    return cardw / card_bundle_size;
+}
+
+// Get the first card word in a card bundle
+size_t card_bundle_cardw (size_t cardb)
+{
+    return cardb * card_bundle_size;
+}
+
+// Clear the specified card bundle
+void gc_heap::card_bundle_clear (size_t cardb)
+{
+    card_bundle_table [card_bundle_word (cardb)] &= ~(1 << card_bundle_bit (cardb));
+    dprintf (1,("Cleared card bundle %Ix [%Ix, %Ix[", cardb, (size_t)card_bundle_cardw (cardb),
+              (size_t)card_bundle_cardw (cardb+1)));
+}
+
+void gc_heap::card_bundle_set (size_t cardb)
+{
+    if (!card_bundle_set_p (cardb))
+    {
+        card_bundle_table [card_bundle_word (cardb)] |= (1 << card_bundle_bit (cardb));
+    }
+}
+
+// Set the card bundle bits between start_cardb and end_cardb
+void gc_heap::card_bundles_set (size_t start_cardb, size_t end_cardb)
+{
+    if (start_cardb == end_cardb)
+    {
+        card_bundle_set(start_cardb);
+        return;
+    }
+
+    size_t start_word = card_bundle_word (start_cardb);
+    size_t end_word = card_bundle_word (end_cardb);
+
+    if (start_word < end_word)
+    {
+        // Set the partial words
+        card_bundle_table [start_word] |= highbits (~0u, card_bundle_bit (start_cardb));
+
+        if (card_bundle_bit (end_cardb))
+            card_bundle_table [end_word] |= lowbits (~0u, card_bundle_bit (end_cardb));
+
+        // Set the full words
+        for (size_t i = start_word + 1; i < end_word; i++)
+            card_bundle_table [i] = ~0u;
+    }
+    else
+    {
+        card_bundle_table [start_word] |= (highbits (~0u, card_bundle_bit (start_cardb)) &
+                                            lowbits (~0u, card_bundle_bit (end_cardb)));
+    }
+}
+
+// Indicates whether the specified bundle is set.
+BOOL gc_heap::card_bundle_set_p (size_t cardb)
+{
+    return (card_bundle_table[card_bundle_word(cardb)] & (1 << card_bundle_bit (cardb)));
+}
+
+// Returns the size (in bytes) of a card bundle representing the region from 'from' to 'end'
+size_t size_card_bundle_of (uint8_t* from, uint8_t* end)
+{
+    // Number of heap bytes represented by a card bundle word
+    size_t cbw_span = card_size * card_word_width * card_bundle_size * card_bundle_word_width;
+
+    // Align the start of the region down
+    from = (uint8_t*)((size_t)from & ~(cbw_span - 1));
+
+    // Align the end of the region up
+    end = (uint8_t*)((size_t)(end + (cbw_span - 1)) & ~(cbw_span - 1));
+
+    // Make sure they're really aligned
+    assert (((size_t)from & (cbw_span - 1)) == 0);
+    assert (((size_t)end  & (cbw_span - 1)) == 0);
+
+    return ((end - from) / cbw_span) * sizeof (uint32_t);
+}
+
+// Takes a pointer to a card bundle table and an address, and returns a pointer that represents
+// where a theoretical card bundle table that represents every address (starting from 0) would
+// start if the bundle word representing the address were to be located at the pointer passed in.
+// The returned 'translated' pointer makes it convenient/fast to calculate where the card bundle
+// for a given address is using a simple shift operation on the address.
+uint32_t* translate_card_bundle_table (uint32_t* cb, uint8_t* lowest_address)
+{
+    // The number of bytes of heap memory represented by a card bundle word
+    const size_t heap_bytes_for_bundle_word = card_size * card_word_width * card_bundle_size * card_bundle_word_width;
+
+    // Each card bundle word is 32 bits
+    return (uint32_t*)((uint8_t*)cb - (((size_t)lowest_address / heap_bytes_for_bundle_word) * sizeof (uint32_t)));
+}
+
+void gc_heap::enable_card_bundles ()
+{
+    if (can_use_write_watch_for_card_table() && (!card_bundles_enabled()))
+    {
+        dprintf (1, ("Enabling card bundles"));
+
+        // We initially set all of the card bundles
+        card_bundles_set (cardw_card_bundle (card_word (card_of (lowest_address))),
+                          cardw_card_bundle (align_cardw_on_bundle (card_word (card_of (highest_address)))));
+        settings.card_bundles = TRUE;
+    }
+}
+
+BOOL gc_heap::card_bundles_enabled ()
+{
+    return settings.card_bundles;
+}
+
+#endif // CARD_BUNDLE
+
 #if defined (_TARGET_AMD64_)
 #define brick_size ((size_t)4096)
 #else
@@ -6392,14 +6566,18 @@ void gc_heap::clear_card (size_t card)
 inline
 void gc_heap::set_card (size_t card)
 {
-    card_table [card_word (card)] =
-        (card_table [card_word (card)] | (1 << card_bit (card)));
-}
+    size_t word = card_word (card);
+    card_table[word] = (card_table [word] | (1 << card_bit (card)));
 
-inline
-void gset_card (size_t card)
-{
-    g_card_table [card_word (card)] |= (1 << card_bit (card));
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    // Also set the card bundle that corresponds to the card
+    size_t bundle_to_set = cardw_card_bundle(word);
+
+    card_bundle_set(bundle_to_set);
+
+    dprintf (3,("Set card %Ix [%Ix, %Ix[ and bundle %Ix", card, (size_t)card_address (card), (size_t)card_address (card+1), bundle_to_set));
+    assert(card_bundle_set_p(bundle_to_set) != 0);
+#endif
 }
 
 inline
@@ -6421,116 +6599,6 @@ size_t size_card_of (uint8_t* from, uint8_t* end)
 {
     return count_card_of (from, end) * sizeof(uint32_t);
 }
-
-#ifdef CARD_BUNDLE
-
-//The card bundle keeps track of groups of card words
-#define card_bundle_word_width ((size_t)32)
-//how do we express the fact that 32 bits (card_word_width) is one uint32_t?
-#define card_bundle_size ((size_t)(OS_PAGE_SIZE/(sizeof (uint32_t)*card_bundle_word_width)))
-
-inline
-size_t card_bundle_word (size_t cardb)
-{
-    return cardb / card_bundle_word_width;
-}
-
-inline
-uint32_t card_bundle_bit (size_t cardb)
-{
-    return (uint32_t)(cardb % card_bundle_word_width);
-}
-
-size_t align_cardw_on_bundle (size_t cardw)
-{
-    return ((size_t)(cardw + card_bundle_size - 1) & ~(card_bundle_size - 1 ));
-}
-
-size_t cardw_card_bundle (size_t cardw)
-{
-    return cardw/card_bundle_size;
-}
-
-size_t card_bundle_cardw (size_t cardb)
-{
-    return cardb*card_bundle_size;
-}
-
-void gc_heap::card_bundle_clear(size_t cardb)
-{
-    card_bundle_table [card_bundle_word (cardb)] &= ~(1 << card_bundle_bit (cardb));
-    dprintf (3,("Cleared card bundle %Ix [%Ix, %Ix[", cardb, (size_t)card_bundle_cardw (cardb),
-              (size_t)card_bundle_cardw (cardb+1)));
-//    printf ("Cleared card bundle %Ix\n", cardb);
-}
-
-void gc_heap::card_bundles_set (size_t start_cardb, size_t end_cardb)
-{
-    size_t start_word = card_bundle_word (start_cardb);
-    size_t end_word = card_bundle_word (end_cardb);
-    if (start_word < end_word)
-    {
-        //set the partial words
-        card_bundle_table [start_word] |= highbits (~0u, card_bundle_bit (start_cardb));
-
-        if (card_bundle_bit (end_cardb))
-            card_bundle_table [end_word] |= lowbits (~0u, card_bundle_bit (end_cardb));
-
-        for (size_t i = start_word+1; i < end_word; i++)
-            card_bundle_table [i] = ~0u;
-
-    }
-    else
-    {
-        card_bundle_table [start_word] |= (highbits (~0u, card_bundle_bit (start_cardb)) &
-                                           lowbits (~0u, card_bundle_bit (end_cardb)));
-
-    }
-
-}
-
-BOOL gc_heap::card_bundle_set_p (size_t cardb)
-{
-    return ( card_bundle_table [ card_bundle_word (cardb) ] & (1 << card_bundle_bit (cardb)));
-}
-
-size_t size_card_bundle_of (uint8_t* from, uint8_t* end)
-{
-    //align from to lower
-    from = (uint8_t*)((size_t)from & ~(card_size*card_word_width*card_bundle_size*card_bundle_word_width - 1));
-    //align to to upper
-    end = (uint8_t*)((size_t)(end + (card_size*card_word_width*card_bundle_size*card_bundle_word_width - 1)) &
-                  ~(card_size*card_word_width*card_bundle_size*card_bundle_word_width - 1));
-
-    assert (((size_t)from & ((card_size*card_word_width*card_bundle_size*card_bundle_word_width)-1)) == 0);
-    assert (((size_t)end  & ((card_size*card_word_width*card_bundle_size*card_bundle_word_width)-1)) == 0);
-
-    return ((end - from) / (card_size*card_word_width*card_bundle_size*card_bundle_word_width)) * sizeof (uint32_t);
-}
-
-uint32_t* translate_card_bundle_table (uint32_t* cb)
-{
-    return (uint32_t*)((uint8_t*)cb - ((((size_t)g_lowest_address) / (card_size*card_word_width*card_bundle_size*card_bundle_word_width)) * sizeof (uint32_t)));
-}
-
-void gc_heap::enable_card_bundles ()
-{
-    if (can_use_write_watch_for_card_table() && (!card_bundles_enabled()))
-    {
-        dprintf (3, ("Enabling card bundles"));
-        //set all of the card bundles
-        card_bundles_set (cardw_card_bundle (card_word (card_of (lowest_address))),
-                          cardw_card_bundle (align_cardw_on_bundle (card_word (card_of (highest_address)))));
-        settings.card_bundles = TRUE;
-    }
-}
-
-BOOL gc_heap::card_bundles_enabled ()
-{
-    return settings.card_bundles;
-}
-
-#endif //CARD_BUNDLE
 
 // We don't store seg_mapping_table in card_table_info because there's only always one view.
 class card_table_info
@@ -6586,6 +6654,7 @@ short*& card_table_brick_table (uint32_t* c_table)
 }
 
 #ifdef CARD_BUNDLE
+// Get the card bundle table for the specified card table.
 inline
 uint32_t*& card_table_card_bundle_table (uint32_t* c_table)
 {
@@ -6722,7 +6791,7 @@ size_t size_mark_array_of (uint8_t* from, uint8_t* end)
 // according to the lowest_address.
 uint32_t* translate_mark_array (uint32_t* ma)
 {
-    return (uint32_t*)((uint8_t*)ma - size_mark_array_of (0, g_lowest_address));
+    return (uint32_t*)((uint8_t*)ma - size_mark_array_of (0, g_gc_lowest_address));
 }
 
 // from and end must be page aligned addresses. 
@@ -6850,16 +6919,20 @@ void release_card_table (uint32_t* c_table)
         {
             destroy_card_table (c_table);
             // sever the link from the parent
-            if (&g_card_table[card_word (gcard_of(g_lowest_address))] == c_table)
+            if (&g_gc_card_table[card_word (gcard_of(g_gc_lowest_address))] == c_table)
             {
-                g_card_table = 0;
+                g_gc_card_table = 0;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+                g_gc_card_bundle_table = 0;
+#endif
 #ifdef FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
                 SoftwareWriteWatch::StaticClose();
 #endif // FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
             }
             else
             {
-                uint32_t* p_table = &g_card_table[card_word (gcard_of(g_lowest_address))];
+                uint32_t* p_table = &g_gc_card_table[card_word (gcard_of(g_gc_lowest_address))];
                 if (p_table)
                 {
                     while (p_table && (card_table_next (p_table) != c_table))
@@ -6881,8 +6954,8 @@ void destroy_card_table (uint32_t* c_table)
 
 uint32_t* gc_heap::make_card_table (uint8_t* start, uint8_t* end)
 {
-    assert (g_lowest_address == start);
-    assert (g_highest_address == end);
+    assert (g_gc_lowest_address == start);
+    assert (g_gc_highest_address == end);
 
     uint32_t virtual_reserve_flags = VirtualReserveFlags::None;
 
@@ -6901,8 +6974,12 @@ uint32_t* gc_heap::make_card_table (uint8_t* start, uint8_t* end)
 #ifdef CARD_BUNDLE
     if (can_use_write_watch_for_card_table())
     {
+        cb = size_card_bundle_of (g_gc_lowest_address, g_gc_highest_address);
+#ifndef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+        // If we're not manually managing the card bundles, we will need to use OS write
+        // watch APIs over this region to track changes.
         virtual_reserve_flags |= VirtualReserveFlags::WriteWatch;
-        cb = size_card_bundle_of (g_lowest_address, g_highest_address);
+#endif
     }
 #endif //CARD_BUNDLE
 
@@ -6918,7 +6995,7 @@ uint32_t* gc_heap::make_card_table (uint8_t* start, uint8_t* end)
 #endif // FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
 
 #ifdef GROWABLE_SEG_MAPPING_TABLE
-    size_t st = size_seg_mapping_table_of (g_lowest_address, g_highest_address);
+    size_t st = size_seg_mapping_table_of (g_gc_lowest_address, g_gc_highest_address);
     size_t st_table_offset = sizeof(card_table_info) + cs + bs + cb + wws;
     size_t st_table_offset_aligned = align_for_seg_mapping_table (st_table_offset);
 
@@ -6932,7 +7009,7 @@ uint32_t* gc_heap::make_card_table (uint8_t* start, uint8_t* end)
     size_t alloc_size = sizeof (uint8_t)*(sizeof(card_table_info) + cs + bs + cb + wws + st + ms);
     size_t alloc_size_aligned = Align (alloc_size, g_SystemInfo.dwAllocationGranularity-1);
 
-    uint8_t* mem = (uint8_t*)GCToOSInterface::VirtualReserve (0, alloc_size_aligned, 0, virtual_reserve_flags);
+    uint8_t* mem = (uint8_t*)GCToOSInterface::VirtualReserve (alloc_size_aligned, 0, virtual_reserve_flags);
 
     if (!mem)
         return 0;
@@ -6961,6 +7038,11 @@ uint32_t* gc_heap::make_card_table (uint8_t* start, uint8_t* end)
 
 #ifdef CARD_BUNDLE
     card_table_card_bundle_table (ct) = (uint32_t*)((uint8_t*)card_table_brick_table (ct) + bs);
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    g_gc_card_bundle_table = translate_card_bundle_table(card_table_card_bundle_table(ct), g_gc_lowest_address);
+#endif
+
 #endif //CARD_BUNDLE
 
 #ifdef FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
@@ -6973,7 +7055,7 @@ uint32_t* gc_heap::make_card_table (uint8_t* start, uint8_t* end)
 #ifdef GROWABLE_SEG_MAPPING_TABLE
     seg_mapping_table = (seg_mapping*)(mem + st_table_offset_aligned);
     seg_mapping_table = (seg_mapping*)((uint8_t*)seg_mapping_table - 
-                                        size_seg_mapping_table_of (0, (align_lower_segment (g_lowest_address))));
+                                        size_seg_mapping_table_of (0, (align_lower_segment (g_gc_lowest_address))));
 #endif //GROWABLE_SEG_MAPPING_TABLE
 
 #ifdef MARK_ARRAY
@@ -7012,10 +7094,11 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
                                      gc_heap* hp, 
                                      BOOL loh_p)
 {
-    uint8_t* la = g_lowest_address;
-    uint8_t* ha = g_highest_address;
-    uint8_t* saved_g_lowest_address = min (start, g_lowest_address);
-    uint8_t* saved_g_highest_address = max (end, g_highest_address);
+    uint8_t* la = g_gc_lowest_address;
+    uint8_t* ha = g_gc_highest_address;
+    uint8_t* saved_g_lowest_address = min (start, g_gc_lowest_address);
+    uint8_t* saved_g_highest_address = max (end, g_gc_highest_address);
+    seg_mapping* new_seg_mapping_table = nullptr;
 #ifdef BACKGROUND_GC
     // This value is only for logging purpose - it's not necessarily exactly what we 
     // would commit for mark array but close enough for diagnostics purpose.
@@ -7045,18 +7128,18 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
 #endif // BIT64
                 ps *= 2;
 
-            if (saved_g_lowest_address < g_lowest_address)
+            if (saved_g_lowest_address < g_gc_lowest_address)
             {
-                if (ps > (size_t)g_lowest_address)
+                if (ps > (size_t)g_gc_lowest_address)
                     saved_g_lowest_address = (uint8_t*)OS_PAGE_SIZE;
                 else
                 {
-                    assert (((size_t)g_lowest_address - ps) >= OS_PAGE_SIZE);
-                    saved_g_lowest_address = min (saved_g_lowest_address, (g_lowest_address - ps));
+                    assert (((size_t)g_gc_lowest_address - ps) >= OS_PAGE_SIZE);
+                    saved_g_lowest_address = min (saved_g_lowest_address, (g_gc_lowest_address - ps));
                 }
             }
 
-            if (saved_g_highest_address > g_highest_address)
+            if (saved_g_highest_address > g_gc_highest_address)
             {
                 saved_g_highest_address = max ((saved_g_lowest_address + ps), saved_g_highest_address);
                 if (saved_g_highest_address > top)
@@ -7069,7 +7152,12 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
 
         bool write_barrier_updated = false;
         uint32_t virtual_reserve_flags = VirtualReserveFlags::None;
-        uint32_t* saved_g_card_table = g_card_table;
+        uint32_t* saved_g_card_table = g_gc_card_table;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+        uint32_t* saved_g_card_bundle_table = g_gc_card_bundle_table;
+#endif
+
         uint32_t* ct = 0;
         uint32_t* translated_ct = 0;
         short* bt = 0;
@@ -7090,8 +7178,13 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
 #ifdef CARD_BUNDLE
         if (can_use_write_watch_for_card_table())
         {
-            virtual_reserve_flags = VirtualReserveFlags::WriteWatch;
             cb = size_card_bundle_of (saved_g_lowest_address, saved_g_highest_address);
+
+#ifndef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+            // If we're not manually managing the card bundles, we will need to use OS write
+            // watch APIs over this region to track changes.
+            virtual_reserve_flags |= VirtualReserveFlags::WriteWatch;
+#endif
         }
 #endif //CARD_BUNDLE
 
@@ -7125,7 +7218,7 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
         dprintf (GC_TABLE_LOG, ("card table: %Id; brick table: %Id; card bundle: %Id; sw ww table: %Id; seg table: %Id; mark array: %Id",
                                   cs, bs, cb, wws, st, ms));
 
-        uint8_t* mem = (uint8_t*)GCToOSInterface::VirtualReserve (0, alloc_size_aligned, 0, virtual_reserve_flags);
+        uint8_t* mem = (uint8_t*)GCToOSInterface::VirtualReserve (alloc_size_aligned, 0, virtual_reserve_flags);
 
         if (!mem)
         {
@@ -7152,7 +7245,7 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
         card_table_refcount (ct) = 0;
         card_table_lowest_address (ct) = saved_g_lowest_address;
         card_table_highest_address (ct) = saved_g_highest_address;
-        card_table_next (ct) = &g_card_table[card_word (gcard_of (la))];
+        card_table_next (ct) = &g_gc_card_table[card_word (gcard_of (la))];
 
         //clear the card table
 /*
@@ -7176,14 +7269,18 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
 
 #ifdef GROWABLE_SEG_MAPPING_TABLE
         {
-            seg_mapping* new_seg_mapping_table = (seg_mapping*)(mem + st_table_offset_aligned);
+            new_seg_mapping_table = (seg_mapping*)(mem + st_table_offset_aligned);
             new_seg_mapping_table = (seg_mapping*)((uint8_t*)new_seg_mapping_table -
                                               size_seg_mapping_table_of (0, (align_lower_segment (saved_g_lowest_address))));
-            memcpy(&new_seg_mapping_table[seg_mapping_word_of(g_lowest_address)],
-                &seg_mapping_table[seg_mapping_word_of(g_lowest_address)],
-                size_seg_mapping_table_of(g_lowest_address, g_highest_address));
+            memcpy(&new_seg_mapping_table[seg_mapping_word_of(g_gc_lowest_address)],
+                &seg_mapping_table[seg_mapping_word_of(g_gc_lowest_address)],
+                size_seg_mapping_table_of(g_gc_lowest_address, g_gc_highest_address));
 
-            seg_mapping_table = new_seg_mapping_table;
+            // new_seg_mapping_table gets assigned to seg_mapping_table at the bottom of this function,
+            // not here. The reason for this is that, if we fail at mark array committing (OOM) and we've
+            // already switched seg_mapping_table to point to the new mapping table, we'll decommit it and
+            // run into trouble. By not assigning here, we're making sure that we will not change seg_mapping_table
+            // if an OOM occurs.
         }
 #endif //GROWABLE_SEG_MAPPING_TABLE
 
@@ -7197,7 +7294,7 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
         translated_ct = translate_card_table (ct);
 
         dprintf (GC_TABLE_LOG, ("card table: %Ix(translated: %Ix), seg map: %Ix, mark array: %Ix", 
-            (size_t)ct, (size_t)translated_ct, (size_t)seg_mapping_table, (size_t)card_table_mark_array (ct)));
+            (size_t)ct, (size_t)translated_ct, (size_t)new_seg_mapping_table, (size_t)card_table_mark_array (ct)));
 
 #ifdef BACKGROUND_GC
         if (hp->should_commit_mark_array())
@@ -7243,12 +7340,16 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
                 // Note on points where the runtime is suspended anywhere in this function. Upon an attempt to suspend the
                 // runtime, a different thread may suspend first, causing this thread to block at the point of the suspend call.
                 // So, at any suspend point, externally visible state needs to be consistent, as code that depends on that state
-                // may run while this thread is blocked. This includes updates to g_card_table, g_lowest_address, and
-                // g_highest_address.
+                // may run while this thread is blocked. This includes updates to g_gc_card_table, g_gc_lowest_address, and
+                // g_gc_highest_address.
                 suspend_EE();
             }
 
-            g_card_table = translated_ct;
+            g_gc_card_table = translated_ct;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+            g_gc_card_bundle_table = translate_card_bundle_table(card_table_card_bundle_table(ct), saved_g_lowest_address);
+#endif
 
             SoftwareWriteWatch::SetResizedUntranslatedTable(
                 mem + sw_ww_table_offset,
@@ -7260,7 +7361,9 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
             // grow version of the write barrier.  This test tells us if the new
             // segment was allocated at a lower address than the old, requiring
             // that we start doing an upper bounds check in the write barrier.
-            StompWriteBarrierResize(true, la != saved_g_lowest_address);
+            g_gc_lowest_address = saved_g_lowest_address;
+            g_gc_highest_address = saved_g_highest_address;
+            stomp_write_barrier_resize(true, la != saved_g_lowest_address);
             write_barrier_updated = true;
 
             if (!is_runtime_suspended)
@@ -7271,8 +7374,18 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
         else
 #endif // FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
         {
-            g_card_table = translated_ct;
+            g_gc_card_table = translated_ct;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+            g_gc_card_bundle_table = translate_card_bundle_table(card_table_card_bundle_table(ct), saved_g_lowest_address);
+#endif
         }
+
+        seg_mapping_table = new_seg_mapping_table;
+
+        GCToOSInterface::FlushProcessWriteBuffers();
+        g_gc_lowest_address = saved_g_lowest_address;
+        g_gc_highest_address = saved_g_highest_address;
 
         if (!write_barrier_updated)
         {
@@ -7284,19 +7397,9 @@ int gc_heap::grow_brick_card_tables (uint8_t* start,
             // to be changed, so we are doing this after all global state has
             // been updated. See the comment above suspend_EE() above for more
             // info.
-            StompWriteBarrierResize(!!IsGCThread(), la != saved_g_lowest_address);
+            stomp_write_barrier_resize(!!IsGCThread(), la != saved_g_lowest_address);
         }
 
-        // We need to make sure that other threads executing checked write barriers
-        // will see the g_card_table update before g_lowest/highest_address updates.
-        // Otherwise, the checked write barrier may AV accessing the old card table
-        // with address that it does not cover. Write barriers access card table 
-        // without memory barriers for performance reasons, so we need to flush 
-        // the store buffers here.
-        GCToOSInterface::FlushProcessWriteBuffers();
-
-        g_lowest_address = saved_g_lowest_address;
-        VolatileStore(&g_highest_address, saved_g_highest_address);
 
         return 0;
         
@@ -7305,7 +7408,11 @@ fail:
 
         if (mem)
         {
-            assert(g_card_table == saved_g_card_table);
+            assert(g_gc_card_table == saved_g_card_table);
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+            assert(g_gc_card_bundle_table  == saved_g_card_bundle_table);
+#endif
 
             //delete (uint32_t*)((uint8_t*)ct - sizeof(card_table_info));
             if (!GCToOSInterface::VirtualRelease (mem, alloc_size_aligned))
@@ -7410,12 +7517,23 @@ void gc_heap::copy_brick_card_range (uint8_t* la, uint32_t* old_card_table,
             (card_table_lowest_address (ct) <= start))
         {
             // or the card_tables
-            uint32_t* dest = &card_table [card_word (card_of (start))];
-            uint32_t* src = &((translate_card_table (ct)) [card_word (card_of (start))]);
+
+            size_t start_word = card_word (card_of (start));
+
+            uint32_t* dest = &card_table[start_word];
+            uint32_t* src = &((translate_card_table (ct))[start_word]);
             ptrdiff_t count = count_card_of (start, end);
             for (int x = 0; x < count; x++)
             {
                 *dest |= *src;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+                if (*src != 0)
+                {
+                    card_bundle_set(cardw_card_bundle(start_word+x));
+                }
+#endif
+
                 dest++;
                 src++;
             }
@@ -7463,7 +7581,7 @@ void gc_heap::copy_brick_card_table()
     assert (ha == card_table_highest_address (&old_card_table[card_word (card_of (la))]));
 
     /* todo: Need a global lock for this */
-    uint32_t* ct = &g_card_table[card_word (gcard_of (g_lowest_address))];
+    uint32_t* ct = &g_gc_card_table[card_word (gcard_of (g_gc_lowest_address))];
     own_card_table (ct);
     card_table = translate_card_table (ct);
     /* End of global lock */
@@ -7476,8 +7594,8 @@ void gc_heap::copy_brick_card_table()
     if (gc_can_use_concurrent)
     {
         mark_array = translate_mark_array (card_table_mark_array (ct));
-        assert (mark_word_of (g_highest_address) ==
-            mark_word_of (align_on_mark_word (g_highest_address)));
+        assert (mark_word_of (g_gc_highest_address) ==
+            mark_word_of (align_on_mark_word (g_gc_highest_address)));
     }
     else
         mark_array = NULL;
@@ -7486,13 +7604,16 @@ void gc_heap::copy_brick_card_table()
 #ifdef CARD_BUNDLE
 #if defined(MARK_ARRAY) && defined(_DEBUG)
 #ifdef GROWABLE_SEG_MAPPING_TABLE
-    size_t st = size_seg_mapping_table_of (g_lowest_address, g_highest_address);
+    size_t st = size_seg_mapping_table_of (g_gc_lowest_address, g_gc_highest_address);
 #else  //GROWABLE_SEG_MAPPING_TABLE
     size_t st = 0;
 #endif //GROWABLE_SEG_MAPPING_TABLE
 #endif //MARK_ARRAY && _DEBUG
-    card_bundle_table = translate_card_bundle_table (card_table_card_bundle_table (ct));
-    assert (&card_bundle_table [card_bundle_word (cardw_card_bundle (card_word (card_of (g_lowest_address))))] ==
+    card_bundle_table = translate_card_bundle_table (card_table_card_bundle_table (ct), g_gc_lowest_address);
+
+    // Ensure that the word that represents g_gc_lowest_address in the translated table is located at the
+    // start of the untranslated table.
+    assert (&card_bundle_table [card_bundle_word (cardw_card_bundle (card_word (card_of (g_gc_lowest_address))))] ==
             card_table_card_bundle_table (ct));
 
     //set the card table if we are in a heap growth scenario
@@ -9313,89 +9434,112 @@ static unsigned int tot_cycles = 0;
 
 #ifdef CARD_BUNDLE
 
+inline void gc_heap::verify_card_bundle_bits_set(size_t first_card_word, size_t last_card_word)
+{
+#ifdef _DEBUG
+    for (size_t x = cardw_card_bundle (first_card_word); x < cardw_card_bundle (last_card_word); x++)
+    {
+        if (!card_bundle_set_p (x))
+        {
+            assert (!"Card bundle not set");
+            dprintf (3, ("Card bundle %Ix not set", x));
+        }
+    }
+#endif
+}
+
+// Verifies that any bundles that are not set represent only cards that are not set.
+inline void gc_heap::verify_card_bundles()
+{
+#ifdef _DEBUG
+    size_t lowest_card = card_word (card_of (lowest_address));
+    size_t highest_card = card_word (card_of (highest_address));
+    size_t cardb = cardw_card_bundle (lowest_card);
+    size_t end_cardb = cardw_card_bundle (align_cardw_on_bundle (highest_card));
+
+    while (cardb < end_cardb)
+    {
+        uint32_t* card_word = &card_table[max(card_bundle_cardw (cardb), lowest_card)];
+        uint32_t* card_word_end = &card_table[min(card_bundle_cardw (cardb+1), highest_card)];
+
+        if (card_bundle_set_p (cardb) == 0)
+        {
+            // Verify that no card is set
+            while (card_word < card_word_end)
+            {
+                if (*card_word != 0)
+                {
+                    dprintf  (3, ("gc: %d, Card word %Ix for address %Ix set, card_bundle %Ix clear",
+                            dd_collection_count (dynamic_data_of (0)), 
+                            (size_t)(card_word-&card_table[0]),
+                            (size_t)(card_address ((size_t)(card_word-&card_table[0]) * card_word_width)), cardb));
+                }
+
+                assert((*card_word)==0);
+                card_word++;
+            }
+        }
+
+        cardb++;
+    }
+#endif
+}
+
+// If card bundles are enabled, use write watch to find pages in the card table that have 
+// been dirtied, and set the corresponding card bundle bits.
 void gc_heap::update_card_table_bundle()
 {
     if (card_bundles_enabled())
     {
+        // The address of the card word containing the card representing the lowest heap address
         uint8_t* base_address = (uint8_t*)(&card_table[card_word (card_of (lowest_address))]);
+
+        // The address of the card word containing the card representing the highest heap address
+        uint8_t* high_address = (uint8_t*)(&card_table[card_word (card_of (highest_address))]);
+        
         uint8_t* saved_base_address = base_address;
         uintptr_t bcount = array_size;
-        uint8_t* high_address = (uint8_t*)(&card_table[card_word (card_of (highest_address))]);
         size_t saved_region_size = align_on_page (high_address) - saved_base_address;
 
         do
         {
             size_t region_size = align_on_page (high_address) - base_address;
+
             dprintf (3,("Probing card table pages [%Ix, %Ix[", (size_t)base_address, (size_t)base_address+region_size));
-            bool success = GCToOSInterface::GetWriteWatch (false /* resetState */ , base_address, region_size,
-                                                           (void**)g_addresses,
-                                                           &bcount);
-            assert (success);
+            bool success = GCToOSInterface::GetWriteWatch(false /* resetState */,
+                                                          base_address,
+                                                          region_size,
+                                                          (void**)g_addresses,
+                                                          &bcount);
+            assert (success && "GetWriteWatch failed!");
+
             dprintf (3,("Found %d pages written", bcount));
-            for (unsigned  i = 0; i < bcount; i++)
+            for (unsigned i = 0; i < bcount; i++)
             {
+                // Offset of the dirty page from the start of the card table (clamped to base_address)
                 size_t bcardw = (uint32_t*)(max(g_addresses[i],base_address)) - &card_table[0];
+
+                // Offset of the end of the page from the start of the card table (clamped to high addr)
                 size_t ecardw = (uint32_t*)(min(g_addresses[i]+OS_PAGE_SIZE, high_address)) - &card_table[0];
-                assert (bcardw >= card_word (card_of (g_lowest_address)));
+                assert (bcardw >= card_word (card_of (g_gc_lowest_address)));
 
-                card_bundles_set (cardw_card_bundle (bcardw),
-                                  cardw_card_bundle (align_cardw_on_bundle (ecardw)));
+                // Set the card bundle bits representing the dirty card table page
+                card_bundles_set (cardw_card_bundle (bcardw), cardw_card_bundle (align_cardw_on_bundle (ecardw)));
+                dprintf (3,("Set Card bundle [%Ix, %Ix[", cardw_card_bundle (bcardw), cardw_card_bundle (align_cardw_on_bundle (ecardw))));
 
-                dprintf (3,("Set Card bundle [%Ix, %Ix[",
-                            cardw_card_bundle (bcardw), cardw_card_bundle (align_cardw_on_bundle (ecardw))));
-
-#ifdef _DEBUG
-                for (size_t x = cardw_card_bundle (bcardw); x < cardw_card_bundle (ecardw); x++)
-                {
-                    if (!card_bundle_set_p (x))
-                    {
-                        assert (!"Card bundle not set");
-                        dprintf (3, ("Card bundle %Ix not set", x));
-                    }
-                }
-#endif //_DEBUG
-
+                verify_card_bundle_bits_set(bcardw, ecardw);
             }
-            if (bcount >= array_size){
+
+            if (bcount >= array_size)
+            {
                 base_address = g_addresses [array_size-1] + OS_PAGE_SIZE;
                 bcount = array_size;
             }
+
         } while ((bcount >= array_size) && (base_address < high_address));
 
+        // Now that we've updated the card bundle bits, reset the write-tracking state. 
         GCToOSInterface::ResetWriteWatch (saved_base_address, saved_region_size);
-
-#ifdef _DEBUG
-
-        size_t lowest_card = card_word (card_of (lowest_address));
-        size_t highest_card = card_word (card_of (highest_address));
-        size_t cardb = cardw_card_bundle (lowest_card);
-        size_t end_cardb = cardw_card_bundle (align_cardw_on_bundle (highest_card));
-
-        //find a non null bundle
-        while (cardb < end_cardb)
-        {
-            if (card_bundle_set_p (cardb)==0)
-            {
-                //verify that the cards are indeed empty
-                uint32_t* card_word = &card_table[max(card_bundle_cardw (cardb), lowest_card)];
-                uint32_t* card_word_end = &card_table[min(card_bundle_cardw (cardb+1), highest_card)];
-                while (card_word < card_word_end)
-                {
-                    if ((*card_word) != 0)
-                    {
-                        dprintf  (3, ("gc: %d, Card word %Ix for address %Ix set, card_bundle %Ix clear",
-                                dd_collection_count (dynamic_data_of (0)), 
-                                (size_t)(card_word-&card_table[0]),
-                                (size_t)(card_address ((size_t)(card_word-&card_table[0]) * card_word_width)), cardb));
-                    }
-                    assert((*card_word)==0);
-                    card_word++;
-                }
-            }
-            //end of verification
-            cardb++;
-        }
-#endif //_DEBUG
     }
 }
 #endif //CARD_BUNDLE
@@ -9639,7 +9783,7 @@ void gc_heap::make_generation (generation& gen, heap_segment* seg, uint8_t* star
 #endif //FREE_USAGE_STATS
 }
 
-void gc_heap::adjust_ephemeral_limits (bool is_runtime_suspended)
+void gc_heap::adjust_ephemeral_limits ()
 {
     ephemeral_low = generation_allocation_start (generation_of (max_generation - 1));
     ephemeral_high = heap_segment_reserved (ephemeral_heap_segment);
@@ -9647,8 +9791,10 @@ void gc_heap::adjust_ephemeral_limits (bool is_runtime_suspended)
     dprintf (3, ("new ephemeral low: %Ix new ephemeral high: %Ix",
                  (size_t)ephemeral_low, (size_t)ephemeral_high))
 
+#ifndef MULTIPLE_HEAPS
     // This updates the write barrier helpers with the new info.
-    StompWriteBarrierEphemeral(is_runtime_suspended);
+    stomp_write_barrier_ephemeral(ephemeral_low, ephemeral_high);
+#endif // MULTIPLE_HEAPS
 }
 
 #if defined(TRACE_GC) || defined(GC_CONFIG_DRIVEN)
@@ -9821,9 +9967,9 @@ HRESULT gc_heap::initialize_gc (size_t segment_size,
 
     settings.first_init();
 
-    g_card_table = make_card_table (g_lowest_address, g_highest_address);
+    g_gc_card_table = make_card_table (g_gc_lowest_address, g_gc_highest_address);
 
-    if (!g_card_table)
+    if (!g_gc_card_table)
         return E_OUTOFMEMORY;
 
     gc_started = FALSE;
@@ -10306,7 +10452,7 @@ gc_heap::init_gc_heap (int  h_number)
 #endif //MULTIPLE_HEAPS
 
     /* todo: Need a global lock for this */
-    uint32_t* ct = &g_card_table [card_word (card_of (g_lowest_address))];
+    uint32_t* ct = &g_gc_card_table [card_word (card_of (g_gc_lowest_address))];
     own_card_table (ct);
     card_table = translate_card_table (ct);
     /* End of global lock */
@@ -10316,14 +10462,14 @@ gc_heap::init_gc_heap (int  h_number)
     lowest_address = card_table_lowest_address (ct);
 
 #ifdef CARD_BUNDLE
-    card_bundle_table = translate_card_bundle_table (card_table_card_bundle_table (ct));
-    assert (&card_bundle_table [card_bundle_word (cardw_card_bundle (card_word (card_of (g_lowest_address))))] ==
+    card_bundle_table = translate_card_bundle_table (card_table_card_bundle_table (ct), g_gc_lowest_address);
+    assert (&card_bundle_table [card_bundle_word (cardw_card_bundle (card_word (card_of (g_gc_lowest_address))))] ==
             card_table_card_bundle_table (ct));
 #endif //CARD_BUNDLE
 
 #ifdef MARK_ARRAY
     if (gc_can_use_concurrent)
-        mark_array = translate_mark_array (card_table_mark_array (&g_card_table[card_word (card_of (g_lowest_address))]));
+        mark_array = translate_mark_array (card_table_mark_array (&g_gc_card_table[card_word (card_of (g_gc_lowest_address))]));
     else
         mark_array = NULL;
 #endif //MARK_ARRAY
@@ -10360,6 +10506,7 @@ gc_heap::init_gc_heap (int  h_number)
                               (size_t)(heap_segment_reserved (lseg) - heap_segment_mem(lseg)), 
                               ETW::GCLog::ETW_GC_INFO::LARGE_OBJECT_HEAP, 
                               GetClrInstanceId());
+
 #ifdef SEG_MAPPING_TABLE
     seg_mapping_table_add_segment (lseg, __this);
 #else //SEG_MAPPING_TABLE
@@ -10442,7 +10589,7 @@ gc_heap::init_gc_heap (int  h_number)
     make_background_mark_stack (b_arr);
 #endif //BACKGROUND_GC
 
-    adjust_ephemeral_limits(true);
+    adjust_ephemeral_limits();
 
 #ifdef MARK_ARRAY
     // why would we clear the mark array for this page? it should be cleared..
@@ -11229,6 +11376,13 @@ void gc_heap::adjust_limit_clr (uint8_t* start, size_t limit_size,
         }
         acontext->alloc_ptr = start;
     }
+    else  
+    {  
+        // If the next alloc context is right up against the current one it means we are absorbing the min  
+        // object, so need to account for that.  
+        acontext->alloc_bytes += (start - acontext->alloc_limit);  
+    }  
+
     acontext->alloc_limit = (start + limit_size - aligned_min_obj_size);
     acontext->alloc_bytes += limit_size - ((gen_number < max_generation + 1) ? aligned_min_obj_size : 0);
 
@@ -13043,11 +13197,11 @@ int gc_heap::try_allocate_more_space (alloc_context* acontext, size_t size,
    
     if (can_allocate)
     {
-        //ETW trace for allocation tick
         size_t alloc_context_bytes = acontext->alloc_limit + Align (min_obj_size, align_const) - acontext->alloc_ptr;
         int etw_allocation_index = ((gen_number == 0) ? 0 : 1);
 
         etw_allocation_running_amount[etw_allocation_index] += alloc_context_bytes;
+
 
         if (etw_allocation_running_amount[etw_allocation_index] > etw_allocation_tick)
         {
@@ -14037,7 +14191,8 @@ uint8_t* gc_heap::allocate_in_condemned_generations (generation* gen,
         to_gen_number = from_gen_number + (settings.promotion ? 1 : 0);
     }
 
-    dprintf (3, ("aic gen%d: s: %Id", gen->gen_num, size));
+    dprintf (3, ("aic gen%d: s: %Id, %d->%d, %Ix->%Ix", gen->gen_num, size, from_gen_number, 
+          to_gen_number, generation_allocation_pointer(gen), generation_allocation_limit(gen)));
 
     int pad_in_front = (old_loc != 0) ? USE_PADDING_FRONT : 0;
 
@@ -14785,6 +14940,9 @@ int gc_heap::generation_to_condemn (int n_initial,
         dprintf (GTC_LOG, ("h%d: alloc full - BLOCK", heap_number));
         n = max_generation;
         *blocking_collection_p = TRUE;
+        if ((local_settings->reason == reason_oos_loh) ||
+            (local_settings->reason == reason_alloc_loh))
+            evaluate_elevation = FALSE;
 
         local_condemn_reasons->set_condition (gen_before_oom);
     }
@@ -15183,7 +15341,11 @@ void gc_heap::gc1()
 
     vm_heap->GcCondemnedGeneration = settings.condemned_generation;
 
-    assert (g_card_table == card_table);
+    assert (g_gc_card_table == card_table);
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    assert (g_gc_card_bundle_table == card_bundle_table);
+#endif    
 
     {
         if (n == max_generation)
@@ -15337,7 +15499,11 @@ void gc_heap::gc1()
     if (!settings.concurrent)
 #endif //BACKGROUND_GC
     {
-        adjust_ephemeral_limits(!!IsGCThread());
+#ifndef FEATURE_REDHAWK
+        // IsGCThread() always returns false on CoreRT, but this assert is useful in CoreCLR.
+        assert(!!IsGCThread());
+#endif // FEATURE_REDHAWK
+        adjust_ephemeral_limits();
     }
 
 #ifdef BACKGROUND_GC
@@ -15472,7 +15638,15 @@ void gc_heap::gc1()
 #ifdef FEATURE_EVENT_TRACE
         if (bgc_heap_walk_for_etw_p && settings.concurrent)
         {
-            make_free_lists_for_profiler_for_bgc();
+            GCToEEInterface::DiagWalkBGCSurvivors(__this);
+
+#ifdef MULTIPLE_HEAPS
+            bgc_t_join.join(this, gc_join_after_profiler_heap_walk);
+            if (bgc_t_join.joined())
+            {
+                bgc_t_join.restart();
+            }
+#endif // MULTIPLE_HEAPS
         }
 #endif // FEATURE_EVENT_TRACE
 #endif //BACKGROUND_GC
@@ -15707,8 +15881,10 @@ start_no_gc_region_status gc_heap::prepare_for_no_gc_region (uint64_t total_size
     size_t allocation_no_gc_soh = 0;
     size_t size_per_heap = 0;
 
+    total_size = (size_t)((float)total_size * 1.05);
     if (loh_size_known)
     {
+        loh_size = (size_t)((float)loh_size * 1.05);
         allocation_no_gc_loh = (size_t)loh_size;
         allocation_no_gc_soh = (size_t)(total_size - loh_size);
     }
@@ -15719,12 +15895,14 @@ start_no_gc_region_status gc_heap::prepare_for_no_gc_region (uint64_t total_size
     }
 
     size_t soh_segment_size = get_valid_segment_size();
+    int soh_align_const = get_alignment_constant (TRUE);
+    size_t max_soh_allocated = (soh_segment_size - OS_PAGE_SIZE - eph_gen_starts_size);
 
     int num_heaps = 1;
 #ifdef MULTIPLE_HEAPS
     num_heaps = n_heaps;
 #endif //MULTIPLE_HEAPS
-    size_t total_allowed_soh_allocation = (soh_segment_size - OS_PAGE_SIZE) * num_heaps;
+    size_t total_allowed_soh_allocation = max_soh_allocated * num_heaps;
 
     if (allocation_no_gc_soh > total_allowed_soh_allocation)
     {
@@ -15737,24 +15915,23 @@ start_no_gc_region_status gc_heap::prepare_for_no_gc_region (uint64_t total_size
 
     if (allocation_no_gc_soh != 0)
     {
-        current_no_gc_region_info.soh_allocation_size = (size_t)((float)allocation_no_gc_soh * 1.05);
-        //current_no_gc_region_info.soh_allocation_size = allocation_no_gc_soh;
+        current_no_gc_region_info.soh_allocation_size = allocation_no_gc_soh;
         size_per_heap = current_no_gc_region_info.soh_allocation_size;
 #ifdef MULTIPLE_HEAPS
         size_per_heap /= n_heaps;
         for (int i = 0; i < n_heaps; i++)
         {
             // due to heap balancing we need to allow some room before we even look to balance to another heap.
-            g_heaps[i]->soh_allocation_no_gc = min (Align (size_per_heap + min_balance_threshold, get_alignment_constant (TRUE)), (soh_segment_size - OS_PAGE_SIZE));
+            g_heaps[i]->soh_allocation_no_gc = min (Align ((size_per_heap + min_balance_threshold), soh_align_const), max_soh_allocated);
         }
 #else //MULTIPLE_HEAPS
-        soh_allocation_no_gc = min (Align (size_per_heap, get_alignment_constant (TRUE)), (soh_segment_size - OS_PAGE_SIZE));
+        soh_allocation_no_gc = min (Align (size_per_heap, soh_align_const), max_soh_allocated);
 #endif //MULTIPLE_HEAPS
     }
 
     if (allocation_no_gc_loh != 0)
     {
-        current_no_gc_region_info.loh_allocation_size = (size_t)((float)allocation_no_gc_loh * 1.05);
+        current_no_gc_region_info.loh_allocation_size = allocation_no_gc_loh;
         size_per_heap = current_no_gc_region_info.loh_allocation_size;
 #ifdef MULTIPLE_HEAPS
         size_per_heap /= n_heaps;
@@ -16142,19 +16319,44 @@ BOOL gc_heap::expand_soh_with_minimal_gc()
     heap_segment* new_seg = soh_get_segment_to_expand();
     if (new_seg)
     {
+        if (g_gc_card_table != card_table)
+            copy_brick_card_table();
+
         settings.promotion = TRUE;
         settings.demotion = FALSE;
         ephemeral_promotion = TRUE;
-        save_ephemeral_generation_starts();
+        int condemned_gen_number = max_generation - 1;
+
+        generation* gen = 0;
+        int align_const = get_alignment_constant (TRUE);
+
+        for (int i = 0; i <= condemned_gen_number; i++)
+        {
+            gen = generation_of (i);
+            saved_ephemeral_plan_start[i] = generation_allocation_start (gen);
+            saved_ephemeral_plan_start_size[i] = Align (size (generation_allocation_start (gen)), align_const);
+        }
+
+        // We do need to clear the bricks here as we are converting a bunch of ephemeral objects to gen2
+        // and need to make sure that there are no left over bricks from the previous GCs for the space 
+        // we just used for gen0 allocation. We will need to go through the bricks for these objects for 
+        // ephemeral GCs later.
+        for (size_t b = brick_of (generation_allocation_start (generation_of (0)));
+             b < brick_of (align_on_brick (heap_segment_allocated (ephemeral_heap_segment)));
+             b++)
+        {
+            set_brick (b, -1);
+        }
+
         size_t ephemeral_size = (heap_segment_allocated (ephemeral_heap_segment) - 
                                 generation_allocation_start (generation_of (max_generation - 1)));
         heap_segment_next (ephemeral_heap_segment) = new_seg;
         ephemeral_heap_segment = new_seg;
         uint8_t*  start = heap_segment_mem (ephemeral_heap_segment);
 
-        for (int i = (max_generation - 1); i >= 0; i--)
+        for (int i = condemned_gen_number; i >= 0; i--)
         {
-            generation* gen = generation_of (i);
+            gen = generation_of (i);
             size_t gen_start_size = Align (min_obj_size);
             make_generation (generation_table[i], ephemeral_heap_segment, start, 0);
             generation_plan_allocation_start (gen) = start;
@@ -16164,22 +16366,47 @@ BOOL gc_heap::expand_soh_with_minimal_gc()
         heap_segment_used (ephemeral_heap_segment) = start - plug_skew;
         heap_segment_plan_allocated (ephemeral_heap_segment) = start;
 
-        fix_generation_bounds ((max_generation - 1), generation_of (0));
+        fix_generation_bounds (condemned_gen_number, generation_of (0));
 
         dd_gc_new_allocation (dynamic_data_of (max_generation)) -= ephemeral_size;
         dd_new_allocation (dynamic_data_of (max_generation)) = dd_gc_new_allocation (dynamic_data_of (max_generation));
 
-        adjust_ephemeral_limits(!!IsGCThread());
+        adjust_ephemeral_limits();
         return TRUE;
     }
     else
         return FALSE;
 }
 
+// Only to be done on the thread that calls restart in a join for server GC
+// and reset the oom status per heap.
+void gc_heap::check_and_set_no_gc_oom()
+{
+#ifdef MULTIPLE_HEAPS
+    for (int i = 0; i < n_heaps; i++)
+    {
+        gc_heap* hp = g_heaps[i];
+        if (hp->no_gc_oom_p)
+        {
+            current_no_gc_region_info.start_status = start_no_gc_no_memory;
+            hp->no_gc_oom_p = false;
+        }
+    }
+#else
+    if (no_gc_oom_p)
+    {
+        current_no_gc_region_info.start_status = start_no_gc_no_memory;
+        no_gc_oom_p = false;
+    }
+#endif //MULTIPLE_HEAPS
+}
+
 void gc_heap::allocate_for_no_gc_after_gc()
 {
     if (current_no_gc_region_info.minimal_gc_p)
         repair_allocation_contexts (TRUE);
+
+    no_gc_oom_p = false;
 
     if (current_no_gc_region_info.start_status != start_no_gc_no_memory)
     {
@@ -16188,18 +16415,19 @@ void gc_heap::allocate_for_no_gc_after_gc()
             if (((size_t)(heap_segment_reserved (ephemeral_heap_segment) - heap_segment_allocated (ephemeral_heap_segment)) < soh_allocation_no_gc) ||
                 (!grow_heap_segment (ephemeral_heap_segment, (heap_segment_allocated (ephemeral_heap_segment) + soh_allocation_no_gc))))
             {
-                current_no_gc_region_info.start_status = start_no_gc_no_memory;
+                no_gc_oom_p = true;
             }
 
 #ifdef MULTIPLE_HEAPS
-            if (!current_no_gc_region_info.minimal_gc_p &&
-                (current_no_gc_region_info.loh_allocation_size != 0))
+            gc_t_join.join(this, gc_join_after_commit_soh_no_gc);
+            if (gc_t_join.joined())
             {
-                gc_t_join.join(this, gc_join_after_commit_soh_no_gc);
-                if (gc_t_join.joined())
-                {
-                    gc_t_join.restart();
-                }
+#endif //MULTIPLE_HEAPS
+
+                check_and_set_no_gc_oom();
+
+#ifdef MULTIPLE_HEAPS
+                gc_t_join.restart();
             }
 #endif //MULTIPLE_HEAPS
         }
@@ -16222,7 +16450,7 @@ void gc_heap::allocate_for_no_gc_after_gc()
                         found_seg_p = TRUE;
                         if (!commit_loh_for_no_gc (seg))
                         {
-                            current_no_gc_region_info.start_status = start_no_gc_no_memory;
+                            no_gc_oom_p = true;
                             break;
                         }
                     }
@@ -16237,20 +16465,31 @@ void gc_heap::allocate_for_no_gc_after_gc()
             gc_t_join.join(this, gc_join_expand_loh_no_gc);
             if (gc_t_join.joined())
             {
-                for (int i = 0; i < n_heaps; i++)
+                check_and_set_no_gc_oom();
+
+                if (current_no_gc_region_info.start_status == start_no_gc_success)
                 {
-                    gc_heap* hp = g_heaps[i];
-                    if (hp->gc_policy == policy_expand)
+                    for (int i = 0; i < n_heaps; i++)
                     {
-                        hp->saved_loh_segment_no_gc = get_segment_for_loh (get_large_seg_size (loh_allocation_no_gc), hp);
-                        if (!(hp->saved_loh_segment_no_gc))
-                            current_no_gc_region_info.start_status = start_no_gc_no_memory;
+                        gc_heap* hp = g_heaps[i];
+                        if (hp->gc_policy == policy_expand)
+                        {
+                            hp->saved_loh_segment_no_gc = get_segment_for_loh (get_large_seg_size (loh_allocation_no_gc), hp);
+                            if (!(hp->saved_loh_segment_no_gc))
+                            {
+                                current_no_gc_region_info.start_status = start_no_gc_no_memory;
+                                break;
+                            }
+                        }
                     }
                 }
+
                 gc_t_join.restart();
             }
 #else //MULTIPLE_HEAPS
-            if (gc_policy == policy_expand)
+            check_and_set_no_gc_oom();
+
+            if ((current_no_gc_region_info.start_status == start_no_gc_success) && (gc_policy == policy_expand))
             {
                 saved_loh_segment_no_gc = get_segment_for_loh (get_large_seg_size (loh_allocation_no_gc));
                 if (!saved_loh_segment_no_gc)
@@ -16262,8 +16501,8 @@ void gc_heap::allocate_for_no_gc_after_gc()
             {
                 if (!commit_loh_for_no_gc (saved_loh_segment_no_gc))
                 {
-                    current_no_gc_region_info.start_status = start_no_gc_no_memory;
-                }                
+                    no_gc_oom_p = true;
+                }
             }
         }
     }
@@ -16273,6 +16512,9 @@ void gc_heap::allocate_for_no_gc_after_gc()
     if (gc_t_join.joined())
     {
 #endif //MULTIPLE_HEAPS
+
+        check_and_set_no_gc_oom();
+
         if (current_no_gc_region_info.start_status == start_no_gc_success)
         {
             set_allocations_for_no_gc();
@@ -16382,7 +16624,7 @@ int gc_heap::garbage_collect (int n)
         for (int i = 0; i < n_heaps; i++)
         {
             //copy the card and brick tables
-            if (g_card_table != g_heaps[i]->card_table)
+            if (g_gc_card_table != g_heaps[i]->card_table)
             {
                 g_heaps[i]->copy_brick_card_table();
             }
@@ -16406,100 +16648,67 @@ int gc_heap::garbage_collect (int n)
             }
 #endif //BACKGROUND_GC
         // check for card table growth
-        if (g_card_table != card_table)
+        if (g_gc_card_table != card_table)
             copy_brick_card_table();
 
 #endif //MULTIPLE_HEAPS
 
-    BOOL should_evaluate_elevation = FALSE;
-    BOOL should_do_blocking_collection = FALSE;
+        BOOL should_evaluate_elevation = FALSE;
+        BOOL should_do_blocking_collection = FALSE;
 
 #ifdef MULTIPLE_HEAPS
-    int gen_max = condemned_generation_num;
-    for (int i = 0; i < n_heaps; i++)
-    {
-        if (gen_max < g_heaps[i]->condemned_generation_num)
-            gen_max = g_heaps[i]->condemned_generation_num;
-        if ((!should_evaluate_elevation) && (g_heaps[i]->elevation_requested))
-            should_evaluate_elevation = TRUE;
-        if ((!should_do_blocking_collection) && (g_heaps[i]->blocking_collection))
-            should_do_blocking_collection = TRUE;
-    }
-
-    settings.condemned_generation = gen_max;
-//logically continues after GC_PROFILING.
-#else //MULTIPLE_HEAPS
-    settings.condemned_generation = generation_to_condemn (n, 
-                                                           &blocking_collection, 
-                                                           &elevation_requested, 
-                                                           FALSE);
-    should_evaluate_elevation = elevation_requested;
-    should_do_blocking_collection = blocking_collection;
-#endif //MULTIPLE_HEAPS
-
-    settings.condemned_generation = joined_generation_to_condemn (
-                                        should_evaluate_elevation, 
-                                        settings.condemned_generation,
-                                        &should_do_blocking_collection
-                                        STRESS_HEAP_ARG(n)
-                                        );
-
-    STRESS_LOG1(LF_GCROOTS|LF_GC|LF_GCALLOC, LL_INFO10, 
-            "condemned generation num: %d\n", settings.condemned_generation);
-
-    record_gcs_during_no_gc();
-
-    if (settings.condemned_generation > 1)
-        settings.promotion = TRUE;
-
-#ifdef HEAP_ANALYZE
-    // At this point we've decided what generation is condemned
-    // See if we've been requested to analyze survivors after the mark phase
-    if (AnalyzeSurvivorsRequested(settings.condemned_generation))
-    {
-        heap_analyze_enabled = TRUE;
-    }
-#endif // HEAP_ANALYZE
-
-#ifdef GC_PROFILING
-
-        // If we're tracking GCs, then we need to walk the first generation
-        // before collection to track how many items of each class has been
-        // allocated.
-        UpdateGenerationBounds();
-        GarbageCollectionStartedCallback(settings.condemned_generation, settings.reason == reason_induced);
+        int gen_max = condemned_generation_num;
+        for (int i = 0; i < n_heaps; i++)
         {
-            BEGIN_PIN_PROFILER(CORProfilerTrackGC());
-            size_t profiling_context = 0;
-
-#ifdef MULTIPLE_HEAPS
-            int hn = 0;
-            for (hn = 0; hn < gc_heap::n_heaps; hn++)
-            {
-                gc_heap* hp = gc_heap::g_heaps [hn];
-
-                // When we're walking objects allocated by class, then we don't want to walk the large
-                // object heap because then it would count things that may have been around for a while.
-                hp->walk_heap (&AllocByClassHelper, (void *)&profiling_context, 0, FALSE);
-            }
-#else
-            // When we're walking objects allocated by class, then we don't want to walk the large
-            // object heap because then it would count things that may have been around for a while.
-            gc_heap::walk_heap (&AllocByClassHelper, (void *)&profiling_context, 0, FALSE);
-#endif //MULTIPLE_HEAPS
-
-            // Notify that we've reached the end of the Gen 0 scan
-            g_profControlBlock.pProfInterface->EndAllocByClass(&profiling_context);
-            END_PIN_PROFILER();
+            if (gen_max < g_heaps[i]->condemned_generation_num)
+                gen_max = g_heaps[i]->condemned_generation_num;
+            if ((!should_evaluate_elevation) && (g_heaps[i]->elevation_requested))
+                should_evaluate_elevation = TRUE;
+            if ((!should_do_blocking_collection) && (g_heaps[i]->blocking_collection))
+                should_do_blocking_collection = TRUE;
         }
 
-#endif // GC_PROFILING
+        settings.condemned_generation = gen_max;
+#else //MULTIPLE_HEAPS
+        settings.condemned_generation = generation_to_condemn (n, 
+                                                            &blocking_collection, 
+                                                            &elevation_requested, 
+                                                            FALSE);
+        should_evaluate_elevation = elevation_requested;
+        should_do_blocking_collection = blocking_collection;
+#endif //MULTIPLE_HEAPS
+
+        settings.condemned_generation = joined_generation_to_condemn (
+                                            should_evaluate_elevation, 
+                                            settings.condemned_generation,
+                                            &should_do_blocking_collection
+                                            STRESS_HEAP_ARG(n)
+                                            );
+
+        STRESS_LOG1(LF_GCROOTS|LF_GC|LF_GCALLOC, LL_INFO10, 
+                "condemned generation num: %d\n", settings.condemned_generation);
+
+        record_gcs_during_no_gc();
+
+        if (settings.condemned_generation > 1)
+            settings.promotion = TRUE;
+
+#ifdef HEAP_ANALYZE
+        // At this point we've decided what generation is condemned
+        // See if we've been requested to analyze survivors after the mark phase
+        if (AnalyzeSurvivorsRequested(settings.condemned_generation))
+        {
+            heap_analyze_enabled = TRUE;
+        }
+#endif // HEAP_ANALYZE
+
+        GCToEEInterface::DiagGCStart(settings.condemned_generation, settings.reason == reason_induced);
 
 #ifdef BACKGROUND_GC
         if ((settings.condemned_generation == max_generation) &&
             (recursive_gc_sync::background_running_p()))
         {
-            //TODO BACKGROUND_GC If we just wait for the end of gc, it won't woork
+            //TODO BACKGROUND_GC If we just wait for the end of gc, it won't work
             // because we have to collect 0 and 1 properly
             // in particular, the allocation contexts are gone.
             // For now, it is simpler to collect max_generation-1
@@ -18513,9 +18722,9 @@ gc_heap::scan_background_roots (promote_func* fn, int hn, ScanContext *pSC)
 
 #endif //BACKGROUND_GC
 
-
 void gc_heap::fix_card_table ()
 {
+#ifdef NO_WRITE_BARRIER
 #ifdef WRITE_WATCH
     heap_segment* seg = heap_segment_rw (generation_start_segment (generation_of (max_generation)));
 
@@ -18581,14 +18790,22 @@ void gc_heap::fix_card_table ()
             dprintf (3,("Found %Id pages written", bcount));
             for (unsigned  i = 0; i < bcount; i++)
             {
-                for (unsigned j = 0; j< (card_size*card_word_width)/OS_PAGE_SIZE; j++)
+                // Set the card words corresponding to the entire page.
+                for (unsigned j = 0; j < (card_size*card_word_width)/OS_PAGE_SIZE; j++)
                 {
                     card_table [card_word (card_of (g_addresses [i]))+j] = ~0u;
                 }
                 dprintf (2,("Set Cards [%Ix:%Ix, %Ix:%Ix[",
                       card_of (g_addresses [i]), (size_t)g_addresses [i],
                       card_of (g_addresses [i]+OS_PAGE_SIZE), (size_t)g_addresses [i]+OS_PAGE_SIZE));
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    // We don't need to update card bundles here because this function is only used when
+    // we don't have write barriers.
+    #error Cannot have manually managed card bundles without write barriers.
+#endif
             }
+
             if (bcount >= array_size){
                 base_address = g_addresses [array_size-1] + OS_PAGE_SIZE;
                 bcount = array_size;
@@ -18609,6 +18826,7 @@ void gc_heap::fix_card_table ()
     }
 #endif //BACKGROUND_GC
 #endif //WRITE_WATCH
+#endif //NO_WRITE_BARRIER
 }
 
 #ifdef BACKGROUND_GC
@@ -19524,7 +19742,15 @@ void gc_heap::mark_phase (int condemned_gen_number, BOOL mark_only_p)
             {
 #endif //MULTIPLE_HEAPS
 
-                update_card_table_bundle ();
+#ifndef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+                // If we are manually managing card bundles, every write to the card table should already be
+                // accounted for in the card bundle table so there's nothing to update here.
+                update_card_table_bundle();
+#endif
+                if (card_bundles_enabled())
+                {
+                    verify_card_bundles();
+                }
 
 #ifdef MULTIPLE_HEAPS
                 gc_t_join.r_restart();
@@ -19625,12 +19851,7 @@ void gc_heap::mark_phase (int condemned_gen_number, BOOL mark_only_p)
     dprintf (3, ("Finalize marking"));
     finalize_queue->ScanForFinalization (GCHeap::Promote, condemned_gen_number, mark_only_p, __this);
 
-#ifdef GC_PROFILING
-    if (CORProfilerTrackGC())
-    {
-        finalize_queue->WalkFReachableObjects (__this);
-    }
-#endif //GC_PROFILING
+    GCToEEInterface::DiagWalkFReachableObjects(__this);
 #endif // FEATURE_PREMORTEM_FINALIZATION
 
     // Scan dependent handles again to promote any secondaries associated with primaries that were promoted
@@ -21105,8 +21326,7 @@ void gc_heap::relocate_in_loh_compact()
         generation_free_obj_space (gen)));
 }
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-void gc_heap::walk_relocation_loh (size_t profiling_context)
+void gc_heap::walk_relocation_for_loh (size_t profiling_context, record_surv_fn fn)
 {
     generation* gen        = large_object_generation;
     heap_segment* seg      = heap_segment_rw (generation_start_segment (gen));
@@ -21136,14 +21356,7 @@ void gc_heap::walk_relocation_loh (size_t profiling_context)
 
             STRESS_LOG_PLUG_MOVE(o, (o + size), -reloc);
 
-            {
-                ETW::GCLog::MovedReference(
-                                    o,
-                                   (o + size),
-                                   reloc,
-                                   profiling_context,
-                                   settings.compaction);
-            }
+            fn (o, (o + size), reloc, profiling_context, settings.compaction, FALSE);
 
             o = o + size;
             if (o < heap_segment_allocated (seg))
@@ -21160,7 +21373,6 @@ void gc_heap::walk_relocation_loh (size_t profiling_context)
         }
     }
 }
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 
 BOOL gc_heap::loh_object_p (uint8_t* o)
 {
@@ -21187,7 +21399,7 @@ void gc_heap::convert_to_pinned_plug (BOOL& last_npinned_plug_p,
     artificial_pinned_size = ps;
 }
 
-// Because we have the artifical pinning, we can't gaurantee that pinned and npinned
+// Because we have the artificial pinning, we can't guarantee that pinned and npinned
 // plugs are always interleaved.
 void gc_heap::store_plug_gap_info (uint8_t* plug_start,
                                    uint8_t* plug_end,
@@ -22318,10 +22530,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
         if (!loh_compacted_p)
 #endif //FEATURE_LOH_COMPACTION
         {
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-            if (ShouldTrackMovementForProfilerOrEtw())
-                notify_profiler_of_surviving_large_objects();
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
+            GCToEEInterface::DiagWalkLOHSurvivors(__this);
             sweep_large_objects();
         }
     }
@@ -22432,7 +22641,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
         for (i = 0; i < n_heaps; i++)
         {
             //copy the card and brick tables
-            if (g_card_table!= g_heaps[i]->card_table)
+            if (g_gc_card_table!= g_heaps[i]->card_table)
             {
                 g_heaps[i]->copy_brick_card_table();
             }
@@ -22523,12 +22732,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
         assert (generation_allocation_segment (consing_gen) ==
                 ephemeral_heap_segment);
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-        if (ShouldTrackMovementForProfilerOrEtw())
-        {
-            record_survived_for_profiler(condemned_gen_number, first_condemned_address);
-        }
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
+        GCToEEInterface::DiagWalkSurvivors(__this);
 
         relocate_phase (condemned_gen_number, first_condemned_address);
         compact_phase (condemned_gen_number, first_condemned_address,
@@ -22738,12 +22942,7 @@ void gc_heap::plan_phase (int condemned_gen_number)
             fix_older_allocation_area (older_gen);
         }
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-        if (ShouldTrackMovementForProfilerOrEtw())
-        {
-            record_survived_for_profiler(condemned_gen_number, first_condemned_address);
-        }
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
+        GCToEEInterface::DiagWalkSurvivors(__this);
 
         gen0_big_free_spaces = 0;
         make_free_lists (condemned_gen_number);
@@ -23949,8 +24148,7 @@ void gc_heap::relocate_survivors (int condemned_gen_number,
     }
 }
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-void gc_heap::walk_plug (uint8_t* plug, size_t size, BOOL check_last_object_p, walk_relocate_args* args, size_t profiling_context)
+void gc_heap::walk_plug (uint8_t* plug, size_t size, BOOL check_last_object_p, walk_relocate_args* args)
 {
     if (check_last_object_p)
     {
@@ -23970,15 +24168,10 @@ void gc_heap::walk_plug (uint8_t* plug, size_t size, BOOL check_last_object_p, w
     }
 
     ptrdiff_t last_plug_relocation = node_relocation_distance (plug);
+    STRESS_LOG_PLUG_MOVE(plug, (plug + size), -last_plug_relocation);
     ptrdiff_t reloc = settings.compaction ? last_plug_relocation : 0;
 
-    STRESS_LOG_PLUG_MOVE(plug, (plug + size), -last_plug_relocation);
-
-    ETW::GCLog::MovedReference(plug,
-                               (plug + size),
-                               reloc,
-                               profiling_context,
-                               settings.compaction);
+    (args->fn) (plug, (plug + size), reloc, args->profiling_context, settings.compaction, FALSE);
 
     if (check_last_object_p)
     {
@@ -23995,12 +24188,12 @@ void gc_heap::walk_plug (uint8_t* plug, size_t size, BOOL check_last_object_p, w
     }
 }
 
-void gc_heap::walk_relocation_in_brick (uint8_t* tree, walk_relocate_args* args, size_t profiling_context)
+void gc_heap::walk_relocation_in_brick (uint8_t* tree, walk_relocate_args* args)
 {
     assert ((tree != NULL));
     if (node_left_child (tree))
     {
-        walk_relocation_in_brick (tree + node_left_child (tree), args, profiling_context);
+        walk_relocation_in_brick (tree + node_left_child (tree), args);
     }
 
     uint8_t*  plug = tree;
@@ -24029,7 +24222,7 @@ void gc_heap::walk_relocation_in_brick (uint8_t* tree, walk_relocate_args* args,
             assert (last_plug_size >= Align (min_obj_size));
         }
 
-        walk_plug (args->last_plug, last_plug_size, check_last_object_p, args, profiling_context);
+        walk_plug (args->last_plug, last_plug_size, check_last_object_p, args);
     }
     else
     {
@@ -24042,18 +24235,14 @@ void gc_heap::walk_relocation_in_brick (uint8_t* tree, walk_relocate_args* args,
 
     if (node_right_child (tree))
     {
-        walk_relocation_in_brick (tree + node_right_child (tree), args, profiling_context);
-
+        walk_relocation_in_brick (tree + node_right_child (tree), args);
     }
 }
 
-void gc_heap::walk_relocation (int condemned_gen_number,
-                               uint8_t* first_condemned_address,
-                               size_t profiling_context)
-
+void gc_heap::walk_relocation (size_t profiling_context, record_surv_fn fn)
 {
-    generation* condemned_gen = generation_of (condemned_gen_number);
-    uint8_t*  start_address = first_condemned_address;
+    generation* condemned_gen = generation_of (settings.condemned_generation);
+    uint8_t*  start_address = generation_allocation_start (condemned_gen);
     size_t  current_brick = brick_of (start_address);
     heap_segment*  current_heap_segment = heap_segment_rw (generation_start_segment (condemned_gen));
 
@@ -24066,6 +24255,8 @@ void gc_heap::walk_relocation (int condemned_gen_number,
     args.is_shortened = FALSE;
     args.pinned_plug_entry = 0;
     args.last_plug = 0;
+    args.profiling_context = profiling_context;
+    args.fn = fn;
 
     while (1)
     {
@@ -24075,8 +24266,8 @@ void gc_heap::walk_relocation (int condemned_gen_number,
             {
                 walk_plug (args.last_plug, 
                            (heap_segment_allocated (current_heap_segment) - args.last_plug), 
-                           args.is_shortened, 
-                           &args, profiling_context);
+                           args.is_shortened,
+                           &args);
                 args.last_plug = 0;
             }
             if (heap_segment_next_rw (current_heap_segment))
@@ -24097,16 +24288,29 @@ void gc_heap::walk_relocation (int condemned_gen_number,
             {
                 walk_relocation_in_brick (brick_address (current_brick) +
                                           brick_entry - 1,
-                                          &args,
-                                          profiling_context);
+                                          &args);
             }
         }
         current_brick++;
     }
 }
 
+void gc_heap::walk_survivors (record_surv_fn fn, size_t context, walk_surv_type type)
+{
+    if (type == walk_for_gc)
+        walk_survivors_relocation (context, fn);
 #if defined(BACKGROUND_GC) && defined(FEATURE_EVENT_TRACE)
-void gc_heap::walk_relocation_for_bgc(size_t profiling_context)
+    else if (type == walk_for_bgc)
+        walk_survivors_for_bgc (context, fn);
+#endif //BACKGROUND_GC && FEATURE_EVENT_TRACE
+    else if (type == walk_for_loh)
+        walk_survivors_for_loh (context, fn);
+    else
+        assert (!"unknown type!");
+}
+
+#if defined(BACKGROUND_GC) && defined(FEATURE_EVENT_TRACE)
+void gc_heap::walk_survivors_for_bgc (size_t profiling_context, record_surv_fn fn)
 {
     // This should only be called for BGCs
     assert(settings.concurrent);
@@ -24140,8 +24344,7 @@ void gc_heap::walk_relocation_for_bgc(size_t profiling_context)
         uint8_t* end = heap_segment_allocated (seg);
 
         while (o < end)
-        {   
-
+        {
             if (method_table(o) == g_pFreeObjectMethodTable)
             {
                 o += Align (size (o), align_const);
@@ -24164,51 +24367,18 @@ void gc_heap::walk_relocation_for_bgc(size_t profiling_context)
                 
             uint8_t* plug_end = o;
 
-            // Note on last parameter: since this is for bgc, only ETW
-            // should be sending these events so that existing profapi profilers
-            // don't get confused.
-            ETW::GCLog::MovedReference(
-                plug_start,
+            fn (plug_start, 
                 plug_end,
                 0,              // Reloc distance == 0 as this is non-compacting
                 profiling_context,
                 FALSE,          // Non-compacting
-                FALSE);         // fAllowProfApiNotification
+                TRUE);          // BGC
         }
 
         seg = heap_segment_next (seg);
     }
 }
-
-void gc_heap::make_free_lists_for_profiler_for_bgc ()
-{
-    assert(settings.concurrent);
-
-    size_t profiling_context = 0;
-    ETW::GCLog::BeginMovedReferences(&profiling_context);
-
-    // This provides the profiler with information on what blocks of
-    // memory are moved during a gc.
-
-    walk_relocation_for_bgc(profiling_context);
-
-    // Notify the EE-side profiling code that all the references have been traced for
-    // this heap, and that it needs to flush all cached data it hasn't sent to the
-    // profiler and release resources it no longer needs.  Since this is for bgc, only
-    // ETW should be sending these events so that existing profapi profilers don't get confused.
-    ETW::GCLog::EndMovedReferences(profiling_context, FALSE /* fAllowProfApiNotification */);
-
-#ifdef MULTIPLE_HEAPS
-    bgc_t_join.join(this, gc_join_after_profiler_heap_walk);
-    if (bgc_t_join.joined())
-    {
-        bgc_t_join.restart();
-    }
-#endif // MULTIPLE_HEAPS
-}
-
 #endif // defined(BACKGROUND_GC) && defined(FEATURE_EVENT_TRACE)
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 
 void gc_heap::relocate_phase (int condemned_gen_number,
                               uint8_t* first_condemned_address)
@@ -24809,7 +24979,7 @@ void gc_heap::compact_phase (int condemned_gen_number,
 #pragma warning(push)
 #pragma warning(disable:4702) // C4702: unreachable code: gc_thread_function may not return
 #endif //_MSC_VER
-void __stdcall gc_heap::gc_thread_stub (void* arg)
+void gc_heap::gc_thread_stub (void* arg)
 {
     ClrFlsSetThreadType (ThreadType_GC);
     STRESS_LOG_RESERVE_MEM (GC_STRESSLOG_MULTIPLY);
@@ -25177,14 +25347,14 @@ BOOL gc_heap::commit_mark_array_new_seg (gc_heap* hp,
 
         if (new_card_table == 0)
         {
-            new_card_table = g_card_table;
+            new_card_table = g_gc_card_table;
         }
 
         if (hp->card_table != new_card_table)
         {
             if (new_lowest_address == 0)
             {
-                new_lowest_address = g_lowest_address;
+                new_lowest_address = g_gc_lowest_address;
             }
 
             uint32_t* ct = &new_card_table[card_word (gcard_of (new_lowest_address))];
@@ -26980,6 +27150,7 @@ void gc_heap::clear_cards (size_t start_card, size_t end_card)
         size_t end_word = card_word (end_card);
         if (start_word < end_word)
         {
+            // Figure out the bit positions of the cards within their words
             unsigned bits = card_bit (start_card);
             card_table [start_word] &= lowbits (~0, bits);
             for (size_t i = start_word+1; i < end_word; i++)
@@ -26993,6 +27164,8 @@ void gc_heap::clear_cards (size_t start_card, size_t end_card)
         }
         else
         {
+            // If the start and end cards are in the same word, just clear the appropriate card
+            // bits in that word.
             card_table [start_word] &= (lowbits (~0, card_bit (start_card)) |
                                         highbits (~0, card_bit (end_card)));
         }
@@ -27020,8 +27193,10 @@ void gc_heap::clear_card_for_addresses (uint8_t* start_address, uint8_t* end_add
 // copy [srccard, ...[ to [dst_card, end_card[
 // This will set the same bit twice. Can be optimized.
 inline
-void gc_heap::copy_cards (size_t dst_card, size_t src_card,
-                 size_t end_card, BOOL nextp)
+void gc_heap::copy_cards (size_t dst_card,
+                          size_t src_card,
+                          size_t end_card, 
+                          BOOL nextp)
 {
     // If the range is empty, this function is a no-op - with the subtlety that
     // either of the accesses card_table[srcwrd] or card_table[dstwrd] could be
@@ -27035,31 +27210,51 @@ void gc_heap::copy_cards (size_t dst_card, size_t src_card,
     size_t dstwrd = card_word (dst_card);
     unsigned int srctmp = card_table[srcwrd];
     unsigned int dsttmp = card_table[dstwrd];
+
     for (size_t card = dst_card; card < end_card; card++)
     {
         if (srctmp & (1 << srcbit))
             dsttmp |= 1 << dstbit;
         else
             dsttmp &= ~(1 << dstbit);
+
         if (!(++srcbit % 32))
         {
             srctmp = card_table[++srcwrd];
             srcbit = 0;
         }
+
         if (nextp)
         {
             if (srctmp & (1 << srcbit))
                 dsttmp |= 1 << dstbit;
         }
+
         if (!(++dstbit % 32))
         {
             card_table[dstwrd] = dsttmp;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+            if (dsttmp != 0)
+            {
+                card_bundle_set(cardw_card_bundle(dstwrd));
+            }
+#endif
+
             dstwrd++;
             dsttmp = card_table[dstwrd];
             dstbit = 0;
         }
     }
+
     card_table[dstwrd] = dsttmp;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    if (dsttmp != 0)
+    {
+        card_bundle_set(cardw_card_bundle(dstwrd));
+    }
+#endif
 }
 
 void gc_heap::copy_cards_for_addresses (uint8_t* dest, uint8_t* src, size_t len)
@@ -27120,6 +27315,10 @@ void gc_heap::copy_cards_for_addresses (uint8_t* dest, uint8_t* src, size_t len)
 
     if (card_set_p (card_of (src + len - 1)))
         set_card (end_dest_card);
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+    card_bundles_set(cardw_card_bundle(card_word(card_of(dest))), cardw_card_bundle(align_cardw_on_bundle(card_word(end_dest_card))));
+#endif
 }
 
 #ifdef BACKGROUND_GC
@@ -27268,6 +27467,9 @@ uint8_t* gc_heap::find_first_object (uint8_t* start, uint8_t* first_object)
 }
 
 #ifdef CARD_BUNDLE
+
+// Find the first non-zero card word between cardw and cardw_end.
+// The index of the word we find is returned in cardw.
 BOOL gc_heap::find_card_dword (size_t& cardw, size_t cardw_end)
 {
     dprintf (3, ("gc: %d, find_card_dword cardw: %Ix, cardw_end: %Ix",
@@ -27279,26 +27481,26 @@ BOOL gc_heap::find_card_dword (size_t& cardw, size_t cardw_end)
         size_t end_cardb = cardw_card_bundle (align_cardw_on_bundle (cardw_end));
         while (1)
         {
-            //find a non null bundle
-            while ((cardb < end_cardb) &&
-                   (card_bundle_set_p (cardb)==0))
+            // Find a non-zero bundle
+            while ((cardb < end_cardb) && (card_bundle_set_p (cardb) == 0))
             {
                 cardb++;
             }
+
             if (cardb == end_cardb)
                 return FALSE;
-            //find a non empty card word
 
+            // We found a bundle, so go through its words and find a non-zero card word
             uint32_t* card_word = &card_table[max(card_bundle_cardw (cardb),cardw)];
             uint32_t* card_word_end = &card_table[min(card_bundle_cardw (cardb+1),cardw_end)];
-            while ((card_word < card_word_end) &&
-                   !(*card_word))
+            while ((card_word < card_word_end) && !(*card_word))
             {
                 card_word++;
             }
+
             if (card_word != card_word_end)
             {
-                cardw = (card_word - &card_table [0]);
+                cardw = (card_word - &card_table[0]);
                 return TRUE;
             }
             else if ((cardw <= card_bundle_cardw (cardb)) &&
@@ -27311,6 +27513,7 @@ BOOL gc_heap::find_card_dword (size_t& cardw, size_t cardw_end)
                         card_bundle_cardw (cardb+1)));
                 card_bundle_clear (cardb);
             }
+
             cardb++;
         }
     }
@@ -27321,96 +27524,122 @@ BOOL gc_heap::find_card_dword (size_t& cardw, size_t cardw_end)
 
         while (card_word < card_word_end)
         {
-            if ((*card_word) != 0)
+            if (*card_word != 0)
             {
                 cardw = (card_word - &card_table [0]);
                 return TRUE;
             }
+
             card_word++;
         }
+
         return FALSE;
-
     }
-
 }
 
 #endif //CARD_BUNDLE
 
-BOOL gc_heap::find_card (uint32_t* card_table, size_t& card,
-                size_t card_word_end, size_t& end_card)
+// Find cards that are set between two points in a card table.
+// Parameters
+//     card_table    : The card table.
+//     card          : [in/out] As input, the card to start searching from.
+//                              As output, the first card that's set.
+//     card_word_end : The card word at which to stop looking.
+//     end_card      : [out] The last card which is set.
+BOOL gc_heap::find_card(uint32_t* card_table,
+                        size_t&   card,
+                        size_t    card_word_end,
+                        size_t&   end_card)
 {
     uint32_t* last_card_word;
-    uint32_t y;
-    uint32_t z;
+    uint32_t card_word_value;
+    uint32_t bit_position;
+    
     // Find the first card which is set
-
     last_card_word = &card_table [card_word (card)];
-    z = card_bit (card);
-    y = (*last_card_word) >> z;
-    if (!y)
+    bit_position = card_bit (card);
+    card_word_value = (*last_card_word) >> bit_position;
+    if (!card_word_value)
     {
-        z = 0;
+        bit_position = 0;
 #ifdef CARD_BUNDLE
-        size_t lcw = card_word(card)+1;
+        // Using the card bundle, go through the remaining card words between here and 
+        // card_word_end until we find one that is non-zero.
+        size_t lcw = card_word(card) + 1;
         if (gc_heap::find_card_dword (lcw, card_word_end) == FALSE)
+        {
             return FALSE;
+        }
         else
         {
             last_card_word = &card_table [lcw];
-            y = *last_card_word;
+            card_word_value = *last_card_word;
         }
 
 #else //CARD_BUNDLE
+        // Go through the remaining card words between here and card_word_end until we find
+        // one that is non-zero.
         do
         {
             ++last_card_word;
         }
+        while ((last_card_word < &card_table [card_word_end]) && !(*last_card_word));
 
-        while ((last_card_word < &card_table [card_word_end]) &&
-               !(*last_card_word));
         if (last_card_word < &card_table [card_word_end])
-            y = *last_card_word;
+        {
+            card_word_value = *last_card_word;
+        }
         else
+        {
+            // We failed to find any non-zero card words before we got to card_word_end
             return FALSE;
+        }
 #endif //CARD_BUNDLE
     }
 
-
     // Look for the lowest bit set
-    if (y)
+    if (card_word_value)
     {
-        while (!(y & 1))
+        while (!(card_word_value & 1))
         {
-            z++;
-            y = y / 2;
+            bit_position++;
+            card_word_value = card_word_value / 2;
         }
     }
-    card = (last_card_word - &card_table [0])* card_word_width + z;
+    
+    // card is the card word index * card size + the bit index within the card
+    card = (last_card_word - &card_table[0]) * card_word_width + bit_position;
+
     do
     {
-        z++;
-        y = y / 2;
-        if ((z == card_word_width) &&
-            (last_card_word < &card_table [card_word_end]))
-        {
+        // Keep going until we get to an un-set card.
+        bit_position++;
+        card_word_value = card_word_value / 2;
 
+        // If we reach the end of the card word and haven't hit a 0 yet, start going
+        // card word by card word until we get to one that's not fully set (0xFFFF...)
+        // or we reach card_word_end.
+        if ((bit_position == card_word_width) && (last_card_word < &card_table [card_word_end]))
+        {
             do
             {
-                y = *(++last_card_word);
-            }while ((last_card_word < &card_table [card_word_end]) &&
+                card_word_value = *(++last_card_word);
+            } while ((last_card_word < &card_table [card_word_end]) &&
+
 #ifdef _MSC_VER
-                     (y == (1 << card_word_width)-1)
+                     (card_word_value == (1 << card_word_width)-1)
 #else
                      // if left shift count >= width of type,
                      // gcc reports error.
-                     (y == ~0u)
+                     (card_word_value == ~0u)
 #endif // _MSC_VER
                 );
-            z = 0;
+            bit_position = 0;
         }
-    } while (y & 1);
+    } while (card_word_value & 1);
 
-    end_card = (last_card_word - &card_table [0])* card_word_width + z;
+    end_card = (last_card_word - &card_table [0])* card_word_width + bit_position;
+    
     //dprintf (3, ("find_card: [%Ix, %Ix[ set", card, end_card));
     dprintf (3, ("fc: [%Ix, %Ix[", card, end_card));
     return TRUE;
@@ -27572,49 +27801,49 @@ void gc_heap::mark_through_cards_for_segments (card_fn fn, BOOL relocating)
 #ifdef BACKGROUND_GC
     dprintf (3, ("current_sweep_pos is %Ix, saved_sweep_ephemeral_seg is %Ix(%Ix)",
                  current_sweep_pos, saved_sweep_ephemeral_seg, saved_sweep_ephemeral_start));
+
     heap_segment* soh_seg = heap_segment_rw (generation_start_segment (generation_of (max_generation)));
-    PREFIX_ASSUME(soh_seg  != NULL);
-    while (soh_seg )
+    PREFIX_ASSUME(soh_seg != NULL);
+
+    while (soh_seg)
     {
         dprintf (3, ("seg %Ix, bgc_alloc: %Ix, alloc: %Ix", 
             soh_seg, 
             heap_segment_background_allocated (soh_seg),
             heap_segment_allocated (soh_seg)));
+
         soh_seg = heap_segment_next_rw (soh_seg);
     }
 #endif //BACKGROUND_GC
 
     uint8_t* low = gc_low;
     uint8_t* high = gc_high;
-    size_t  end_card          = 0;
+    size_t end_card = 0;
+
     generation*   oldest_gen        = generation_of (max_generation);
     int           curr_gen_number   = max_generation;
-    uint8_t*         gen_boundary      = generation_allocation_start
-        (generation_of (curr_gen_number - 1));
-    uint8_t*         next_boundary     = (compute_next_boundary
-                                       (gc_low, curr_gen_number, relocating));
+    uint8_t*      gen_boundary      = generation_allocation_start(generation_of(curr_gen_number - 1));
+    uint8_t*      next_boundary     = compute_next_boundary(gc_low, curr_gen_number, relocating);
+    
     heap_segment* seg               = heap_segment_rw (generation_start_segment (oldest_gen));
-
     PREFIX_ASSUME(seg != NULL);
 
-    uint8_t*         beg               = generation_allocation_start (oldest_gen);
-    uint8_t*         end               = compute_next_end (seg, low);
-    uint8_t*         last_object       = beg;
+    uint8_t*      beg               = generation_allocation_start (oldest_gen);
+    uint8_t*      end               = compute_next_end (seg, low);
+    uint8_t*      last_object       = beg;
 
     size_t  cg_pointers_found = 0;
 
-    size_t  card_word_end = (card_of (align_on_card_word (end)) /
-                             card_word_width);
+    size_t  card_word_end = (card_of (align_on_card_word (end)) / card_word_width);
 
     size_t        n_eph             = 0;
     size_t        n_gen             = 0;
     size_t        n_card_set        = 0;
-    uint8_t*         nhigh             = (relocating ?
-                                       heap_segment_plan_allocated (ephemeral_heap_segment) : high);
+    uint8_t*      nhigh             = (relocating ? heap_segment_plan_allocated (ephemeral_heap_segment) : high);
 
     BOOL          foundp            = FALSE;
-    uint8_t*         start_address     = 0;
-    uint8_t*         limit             = 0;
+    uint8_t*      start_address     = 0;
+    uint8_t*      limit             = 0;
     size_t        card              = card_of (beg);
 #ifdef BACKGROUND_GC
     BOOL consider_bgc_mark_p        = FALSE;
@@ -27630,6 +27859,7 @@ void gc_heap::mark_through_cards_for_segments (card_fn fn, BOOL relocating)
     {
         if (card_of(last_object) > card)
         {
+            // cg means cross-generational
             dprintf (3, ("Found %Id cg pointers", cg_pointers_found));
             if (cg_pointers_found == 0)
             {
@@ -27638,23 +27868,29 @@ void gc_heap::mark_through_cards_for_segments (card_fn fn, BOOL relocating)
                 n_card_set -= (card_of (last_object) - card);
                 total_cards_cleared += (card_of (last_object) - card);
             }
-            n_eph +=cg_pointers_found;
+
+            n_eph += cg_pointers_found;
             cg_pointers_found = 0;
             card = card_of (last_object);
         }
+
         if (card >= end_card)
         {
-            foundp = find_card (card_table, card, card_word_end, end_card);
+            // Find the first card that's set (between card and card_word_end)
+            foundp = find_card(card_table, card, card_word_end, end_card);
             if (foundp)
             {
-                n_card_set+= end_card - card;
+                // We found card(s) set. 
+                n_card_set += end_card - card;
                 start_address = max (beg, card_address (card));
             }
+
             limit = min (end, card_address (end_card));
         }
-        if ((!foundp) || (last_object >= end) || (card_address (card) >= end))
+
+        if (!foundp || (last_object >= end) || (card_address (card) >= end))
         {
-            if ((foundp) && (cg_pointers_found == 0))
+            if (foundp && (cg_pointers_found == 0))
             {
                 dprintf(3,(" Clearing cards [%Ix, %Ix[ ", (size_t)card_address(card),
                            (size_t)end));
@@ -27662,8 +27898,10 @@ void gc_heap::mark_through_cards_for_segments (card_fn fn, BOOL relocating)
                 n_card_set -= (card_of (end) - card);
                 total_cards_cleared += (card_of (end) - card);
             }
-            n_eph +=cg_pointers_found;
+
+            n_eph += cg_pointers_found;
             cg_pointers_found = 0;
+
             if ((seg = heap_segment_next_in_range (seg)) != 0)
             {
 #ifdef BACKGROUND_GC
@@ -27683,17 +27921,17 @@ void gc_heap::mark_through_cards_for_segments (card_fn fn, BOOL relocating)
             }
         }
 
+        // We've found a card and will now go through the objects in it.
         assert (card_set_p (card));
         {
-            uint8_t*   o             = last_object;
-
+            uint8_t* o = last_object;
             o = find_first_object (start_address, last_object);
-                //Never visit an object twice.
-                assert (o >= last_object);
+            // Never visit an object twice.
+            assert (o >= last_object);
 
-                //dprintf(3,("Considering card %Ix start object: %Ix, %Ix[ boundary: %Ix",
-                dprintf(3, ("c: %Ix, o: %Ix, l: %Ix[ boundary: %Ix",
-                       card, (size_t)o, (size_t)limit, (size_t)gen_boundary));
+            //dprintf(3,("Considering card %Ix start object: %Ix, %Ix[ boundary: %Ix",
+            dprintf(3, ("c: %Ix, o: %Ix, l: %Ix[ boundary: %Ix",
+                   card, (size_t)o, (size_t)limit, (size_t)gen_boundary));
 
             while (o < limit)
             {
@@ -29174,7 +29412,7 @@ generation* gc_heap::expand_heap (int condemned_generation,
         return consing_gen;
 
     //copy the card and brick tables
-    if (g_card_table!= card_table)
+    if (g_gc_card_table!= card_table)
         copy_brick_card_table();
 
     BOOL new_segment_p = (heap_segment_next (new_seg) == 0);
@@ -30484,18 +30722,20 @@ CObjectHeader* gc_heap::allocate_large_object (size_t jsize, int64_t& alloc_byte
 #endif //BACKGROUND_GC
 #endif // MARK_ARRAY
 
-    // these next few lines are not strictly necessary anymore - they are here
-    // to sanity check that we didn't get asked to create an object
-    // that's too large.
     #if BIT64
-    size_t maxObjectSize = (INT64_MAX - 7 - Align(min_obj_size)); 
+    size_t maxObjectSize = (INT64_MAX - 7 - Align(min_obj_size));
     #else
-    size_t maxObjectSize = (INT32_MAX - 7 - Align(min_obj_size)); 
+    size_t maxObjectSize = (INT32_MAX - 7 - Align(min_obj_size));
     #endif
 
-    // The VM should have thrown instead of passing us an allocation
-    // request that's too large.
-    assert(jsize < maxObjectSize);
+    if (jsize >= maxObjectSize)
+    {
+        if (g_pConfig->IsGCBreakOnOOMEnabled())
+        {
+            GCToOSInterface::DebugBreak();
+        }
+        return NULL;
+    }
 
     size_t size = AlignQword (jsize);
     int align_const = get_alignment_constant (FALSE);
@@ -30526,6 +30766,7 @@ CObjectHeader* gc_heap::allocate_large_object (size_t jsize, int64_t& alloc_byte
     uint8_t*  result = acontext.alloc_ptr;
 
     assert ((size_t)(acontext.alloc_limit - acontext.alloc_ptr) == size);
+    alloc_bytes += size;
 
     CObjectHeader* obj = (CObjectHeader*)result;
 
@@ -30562,7 +30803,6 @@ CObjectHeader* gc_heap::allocate_large_object (size_t jsize, int64_t& alloc_byte
     assert (obj != 0);
     assert ((size_t)obj == Align ((size_t)obj, align_const));
 
-    alloc_bytes += acontext.alloc_bytes;
     return obj;
 }
 
@@ -30617,35 +30857,21 @@ BOOL gc_heap::large_object_marked (uint8_t* o, BOOL clearp)
     return m;
 }
 
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
-void gc_heap::record_survived_for_profiler(int condemned_gen_number, uint8_t * start_address)
+void gc_heap::walk_survivors_relocation (size_t profiling_context, record_surv_fn fn)
 {
-    size_t profiling_context = 0;
-
-    ETW::GCLog::BeginMovedReferences(&profiling_context);
-
     // Now walk the portion of memory that is actually being relocated.
-    walk_relocation(condemned_gen_number, start_address, profiling_context);
+    walk_relocation (profiling_context, fn);
 
 #ifdef FEATURE_LOH_COMPACTION
     if (loh_compacted_p)
     {
-        walk_relocation_loh (profiling_context);
+        walk_relocation_for_loh (profiling_context, fn);
     }
 #endif //FEATURE_LOH_COMPACTION
-
-    // Notify the EE-side profiling code that all the references have been traced for
-    // this heap, and that it needs to flush all cached data it hasn't sent to the
-    // profiler and release resources it no longer needs.
-    ETW::GCLog::EndMovedReferences(profiling_context);
 }
 
-void gc_heap::notify_profiler_of_surviving_large_objects ()
+void gc_heap::walk_survivors_for_loh (size_t profiling_context, record_surv_fn fn)
 {
-    size_t profiling_context = 0;
-
-    ETW::GCLog::BeginMovedReferences(&profiling_context);
-
     generation* gen        = large_object_generation;
     heap_segment* seg      = heap_segment_rw (generation_start_segment (gen));;
 
@@ -30654,13 +30880,6 @@ void gc_heap::notify_profiler_of_surviving_large_objects ()
     uint8_t* o                = generation_allocation_start (gen);
     uint8_t* plug_end         = o;
     uint8_t* plug_start       = o;
-
-    // Generally, we can only get here if this is TRUE:
-    // (CORProfilerTrackGC() || ETW::GCLog::ShouldTrackMovementForEtw())
-    // But we can't always assert that, as races could theoretically cause GC profiling
-    // or ETW to turn off just before we get here.  This is harmless (we do checks later
-    // on, under appropriate locks, before actually calling into profilers), though it's
-    // a slowdown to determine these plugs for nothing.
 
     while (1)
     {
@@ -30689,12 +30908,7 @@ void gc_heap::notify_profiler_of_surviving_large_objects ()
 
             plug_end = o;
 
-            ETW::GCLog::MovedReference(
-                plug_start,
-                plug_end,
-                0,
-                profiling_context,
-                FALSE);
+            fn (plug_start, plug_end, 0, profiling_context, FALSE, FALSE);
         }
         else
         {
@@ -30704,9 +30918,7 @@ void gc_heap::notify_profiler_of_surviving_large_objects ()
             }
         }
     }
-    ETW::GCLog::EndMovedReferences(profiling_context);
 }
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 
 #ifdef BACKGROUND_GC
 
@@ -31938,7 +32150,6 @@ void gc_heap::descr_card_table ()
 
 void gc_heap::descr_generations_to_profiler (gen_walk_fn fn, void *context)
 {
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 #ifdef MULTIPLE_HEAPS
     int n_heaps = g_theGCHeap->GetNumberOfHeaps ();
     for (int i = 0; i < n_heaps; i++)
@@ -32016,7 +32227,6 @@ void gc_heap::descr_generations_to_profiler (gen_walk_fn fn, void *context)
             curr_gen_number0--;
         }
     }
-#endif // defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
 }
 
 #ifdef TRACE_GC
@@ -32231,45 +32441,18 @@ int                 GCHeap::m_CurStressObj          = 0;
 #endif // FEATURE_REDHAWK
 
 #endif //FEATURE_PREMORTEM_FINALIZATION
-inline
-static void spin_lock ()
-{
-    enter_spin_lock_noinstru (&m_GCLock);
-}
 
-inline
-void EnterAllocLock()
-{
-#if defined(_TARGET_X86_)
-    __asm {
-        inc dword ptr m_GCLock
-        jz gotit
-        call spin_lock
-            gotit:
-    }
-#else //_TARGET_X86_
-    spin_lock();
-#endif //_TARGET_X86_
-}
-
-inline
-void LeaveAllocLock()
-{
-    // Trick this out
-    leave_spin_lock_noinstru (&m_GCLock);
-}
-
-class AllocLockHolder
+class NoGCRegionLockHolder
 {
 public:
-    AllocLockHolder()
+    NoGCRegionLockHolder()
     {
-        EnterAllocLock();
+        enter_spin_lock_noinstru(&g_no_gc_lock);
     }
 
-    ~AllocLockHolder()
+    ~NoGCRegionLockHolder()
     {
-        LeaveAllocLock();
+        leave_spin_lock_noinstru(&g_no_gc_lock);
     }
 };
 
@@ -32512,7 +32695,7 @@ void gc_heap::clear_all_mark_array()
 void gc_heap::verify_mark_array_cleared (heap_segment* seg)
 {
 #if defined (VERIFY_HEAP) && defined (MARK_ARRAY)
-    assert (card_table == g_card_table);
+    assert (card_table == g_gc_card_table);
     size_t  markw = mark_word_of (heap_segment_mem (seg));
     size_t  markw_end = mark_word_of (heap_segment_reserved (seg));
 
@@ -32860,8 +33043,8 @@ gc_heap::verify_heap (BOOL begin_gc_p)
 #endif //BACKGROUND_GC 
 
 #ifndef MULTIPLE_HEAPS
-    if ((g_ephemeral_low != generation_allocation_start (generation_of (max_generation - 1))) ||
-        (g_ephemeral_high != heap_segment_reserved (ephemeral_heap_segment)))
+    if ((ephemeral_low != generation_allocation_start (generation_of (max_generation - 1))) ||
+        (ephemeral_high != heap_segment_reserved (ephemeral_heap_segment)))
     {
         FATAL_GC_ERROR();
     }
@@ -32920,7 +33103,7 @@ gc_heap::verify_heap (BOOL begin_gc_p)
         for (int i = 0; i < n_heaps; i++)
         {
             //copy the card and brick tables
-            if (g_card_table != g_heaps[i]->card_table)
+            if (g_gc_card_table != g_heaps[i]->card_table)
             {
                 g_heaps[i]->copy_brick_card_table();
             }
@@ -32929,7 +33112,7 @@ gc_heap::verify_heap (BOOL begin_gc_p)
         current_join->restart();
     }
 #else
-        if (g_card_table != card_table)
+        if (g_gc_card_table != card_table)
             copy_brick_card_table();
 #endif //MULTIPLE_HEAPS
 
@@ -33354,11 +33537,15 @@ HRESULT GCHeap::Shutdown ()
     //CloseHandle (WaitForGCEvent);
 
     //find out if the global card table hasn't been used yet
-    uint32_t* ct = &g_card_table[card_word (gcard_of (g_lowest_address))];
+    uint32_t* ct = &g_gc_card_table[card_word (gcard_of (g_gc_lowest_address))];
     if (card_table_refcount (ct) == 0)
     {
         destroy_card_table (ct);
-        g_card_table = 0;
+        g_gc_card_table = nullptr;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+        g_gc_card_bundle_table = nullptr;
+#endif
 #ifdef FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
         SoftwareWriteWatch::StaticClose();
 #endif // FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
@@ -33416,14 +33603,6 @@ HRESULT AllocateCFinalize(CFinalize **pCFinalize)
 HRESULT GCHeap::Init(size_t hn)
 {
     HRESULT hres = S_OK;
-
-    //Initialize all of the instance members.
-
-#ifdef MULTIPLE_HEAPS
-    m_GCLock                = -1;
-#endif //MULTIPLE_HEAPS
-
-    // Rest of the initialization
 
 #ifdef MULTIPLE_HEAPS
     if ((pGenGCHeap = gc_heap::make_gc_heap(this, (int)hn)) == 0)
@@ -33518,7 +33697,7 @@ HRESULT GCHeap::Initialize ()
         return E_FAIL;
     }
 
-    StompWriteBarrierResize(true, false);
+    stomp_write_barrier_initialize();
 
 #ifndef FEATURE_REDHAWK // Redhawk forces relocation a different way
 #if defined (STRESS_HEAP) && !defined (MULTIPLE_HEAPS)
@@ -33555,10 +33734,7 @@ HRESULT GCHeap::Initialize ()
     {
         GCScan::GcRuntimeStructuresValid (TRUE);
 
-#ifdef GC_PROFILING
-        if (CORProfilerTrackGC())
-            UpdateGenerationBounds();
-#endif // GC_PROFILING
+        GCToEEInterface::DiagUpdateGenerationBounds();
     }
 
     return hr;
@@ -33642,7 +33818,7 @@ Object * GCHeap::NextObj (Object * object)
     uint8_t* o = (uint8_t*)object;
 
 #ifndef FEATURE_BASICFREEZE
-    if (!((o < g_highest_address) && (o >= g_lowest_address)))
+    if (!((o < g_gc_highest_address) && (o >= g_gc_lowest_address)))
     {
         return NULL;
     }
@@ -33713,7 +33889,7 @@ BOOL GCHeap::IsHeapPointer (void* vpObject, BOOL small_heap_only)
 
     uint8_t* object = (uint8_t*) vpObject;
 #ifndef FEATURE_BASICFREEZE
-    if (!((object < g_highest_address) && (object >= g_lowest_address)))
+    if (!((object < g_gc_highest_address) && (object >= g_gc_lowest_address)))
         return FALSE;
 #endif //!FEATURE_BASICFREEZE
 
@@ -33925,6 +34101,7 @@ BOOL GCHeap::StressHeap(gc_alloc_context * context)
 {
 #if defined(STRESS_HEAP) && !defined(FEATURE_REDHAWK)
     alloc_context* acontext = static_cast<alloc_context*>(context);
+    assert(context != nullptr);
 
     // if GC stress was dynamically disabled during this run we return FALSE
     if (!GCStressPolicy::IsEnabled())
@@ -34005,9 +34182,6 @@ BOOL GCHeap::StressHeap(gc_alloc_context * context)
 
 #ifndef MULTIPLE_HEAPS
     static int32_t OneAtATime = -1;
-
-    if (acontext == 0)
-        acontext = generation_alloc_context (pGenGCHeap->generation_of(0));
 
     // Only bother with this if the stress level is big enough and if nobody else is
     // doing it right now.  Note that some callers are inside the AllocLock and are
@@ -34131,122 +34305,7 @@ BOOL GCHeap::StressHeap(gc_alloc_context * context)
 // Small Object Allocator
 //
 //
-Object *
-GCHeap::Alloc( size_t size, uint32_t flags REQD_ALIGN_DCL)
-{
-    CONTRACTL {
-        NOTHROW;
-        GC_TRIGGERS;
-    } CONTRACTL_END;
-
-    TRIGGERSGC();
-
-    Object* newAlloc = NULL;
-
-#ifdef TRACE_GC
-#ifdef COUNT_CYCLES
-    AllocStart = GetCycleCount32();
-    unsigned finish;
-#elif defined(ENABLE_INSTRUMENTATION)
-    unsigned AllocStart = GetInstLogTime();
-    unsigned finish;
-#endif //COUNT_CYCLES
-#endif //TRACE_GC
-
-#ifdef MULTIPLE_HEAPS
-    //take the first heap....
-    gc_heap* hp = gc_heap::g_heaps[0];
-#else
-    gc_heap* hp = pGenGCHeap;
-#ifdef _PREFAST_
-    // prefix complains about us dereferencing hp in wks build even though we only access static members
-    // this way. not sure how to shut it up except for this ugly workaround:
-    PREFIX_ASSUME(hp != NULL);
-#endif //_PREFAST_
-#endif //MULTIPLE_HEAPS
-
-    {
-        AllocLockHolder lh;
-
-#ifndef FEATURE_REDHAWK
-        GCStress<gc_on_alloc>::MaybeTrigger(generation_alloc_context(hp->generation_of(0)));
-#endif // FEATURE_REDHAWK
-
-        alloc_context* acontext = 0;
-
-        if (size < LARGE_OBJECT_SIZE)
-        {
-            acontext = generation_alloc_context (hp->generation_of (0));
-
-#ifdef TRACE_GC
-            AllocSmallCount++;
-#endif //TRACE_GC
-            newAlloc = (Object*) hp->allocate (size + ComputeMaxStructAlignPad(requiredAlignment), acontext);
-#ifdef FEATURE_STRUCTALIGN
-            newAlloc = (Object*) hp->pad_for_alignment ((uint8_t*) newAlloc, requiredAlignment, size, acontext);
-#endif // FEATURE_STRUCTALIGN
-            // ASSERT (newAlloc);
-        }
-        else
-        {
-            acontext = generation_alloc_context (hp->generation_of (max_generation+1));
-
-            newAlloc = (Object*) hp->allocate_large_object (size + ComputeMaxStructAlignPadLarge(requiredAlignment), acontext->alloc_bytes_loh);
-#ifdef FEATURE_STRUCTALIGN
-            newAlloc = (Object*) hp->pad_for_alignment_large ((uint8_t*) newAlloc, requiredAlignment, size);
-#endif // FEATURE_STRUCTALIGN
-        }
-    }
-
-    CHECK_ALLOC_AND_POSSIBLY_REGISTER_FOR_FINALIZATION(newAlloc, size, flags & GC_ALLOC_FINALIZE);
-
-#ifdef TRACE_GC
-#ifdef COUNT_CYCLES
-    finish = GetCycleCount32();
-#elif defined(ENABLE_INSTRUMENTATION)
-    finish = GetInstLogTime();
-#endif //COUNT_CYCLES
-    AllocDuration += finish - AllocStart;
-    AllocCount++;
-#endif //TRACE_GC
-    return newAlloc;
-}
-
-// Allocate small object with an alignment requirement of 8-bytes. Non allocation context version.
-Object *
-GCHeap::AllocAlign8( size_t size, uint32_t flags)
-{
-#ifdef FEATURE_64BIT_ALIGNMENT
-    CONTRACTL {
-        NOTHROW;
-        GC_TRIGGERS;
-    } CONTRACTL_END;
-
-    Object* newAlloc = NULL;
-
-    {
-        AllocLockHolder lh;
-
-#ifdef MULTIPLE_HEAPS
-        //take the first heap....
-        gc_heap* hp = gc_heap::g_heaps[0];
-#else
-        gc_heap* hp = pGenGCHeap;
-#endif //MULTIPLE_HEAPS
-
-        newAlloc = AllocAlign8Common(hp, generation_alloc_context (hp->generation_of (0)), size, flags);
-    }
-
-    return newAlloc;
-#else
-    UNREFERENCED_PARAMETER(size);
-    UNREFERENCED_PARAMETER(flags);
-    assert(!"should not call GCHeap::AllocAlign8 without FEATURE_64BIT_ALIGNMENT defined!");
-    return nullptr;
-#endif  //FEATURE_64BIT_ALIGNMENT
-}
-
-// Allocate small object with an alignment requirement of 8-bytes. Allocation context version.
+// Allocate small object with an alignment requirement of 8-bytes.
 Object*
 GCHeap::AllocAlign8(gc_alloc_context* ctx, size_t size, uint32_t flags )
 {
@@ -34434,10 +34493,6 @@ GCHeap::AllocLHeap( size_t size, uint32_t flags REQD_ALIGN_DCL)
     PREFIX_ASSUME(hp != NULL);
 #endif //_PREFAST_
 #endif //MULTIPLE_HEAPS
-
-#ifndef FEATURE_REDHAWK
-    GCStress<gc_on_alloc>::MaybeTrigger(generation_alloc_context(hp->generation_of(0)));
-#endif // FEATURE_REDHAWK
 
     alloc_context* acontext = generation_alloc_context (hp->generation_of (max_generation+1));
 
@@ -34967,7 +35022,6 @@ void gc_heap::do_post_gc()
 {
     if (!settings.concurrent)
     {
-        GCProfileWalkHeap();
         initGCShadow();
     }
 
@@ -34987,13 +35041,10 @@ void gc_heap::do_post_gc()
     
     GCToEEInterface::GcDone(settings.condemned_generation);
 
-#ifdef GC_PROFILING
-    if (!settings.concurrent)
-    {
-        UpdateGenerationBounds();
-        GarbageCollectionFinishedCallback();
-    }
-#endif // GC_PROFILING
+    GCToEEInterface::DiagGCEnd(VolatileLoad(&settings.gc_index),
+                         (uint32_t)settings.condemned_generation,
+                         (uint32_t)settings.reason,
+                         !!settings.concurrent);
 
     //dprintf (1, (" ****end of Garbage Collection**** %d(gen0:%d)(%d)", 
     dprintf (1, ("*EGC* %d(gen0:%d)(%d)(%s)", 
@@ -35229,11 +35280,7 @@ GCHeap::GarbageCollectGeneration (unsigned int gen, gc_reason reason)
 #endif //!MULTIPLE_HEAPS
 
 #ifdef FEATURE_PREMORTEM_FINALIZATION
-    if ((!pGenGCHeap->settings.concurrent && pGenGCHeap->settings.found_finalizers) || 
-        FinalizerThread::HaveExtraWorkForFinalizer())
-    {
-        FinalizerThread::EnableFinalization();
-    }
+    GCToEEInterface::EnableFinalization(!pGenGCHeap->settings.concurrent && pGenGCHeap->settings.found_finalizers);
 #endif // FEATURE_PREMORTEM_FINALIZATION
 
     return dd_collection_count (dd);
@@ -35505,7 +35552,7 @@ int GCHeap::WaitForFullGCComplete(int millisecondsTimeout)
 
 int GCHeap::StartNoGCRegion(uint64_t totalSize, BOOL lohSizeKnown, uint64_t lohSize, BOOL disallowFullBlockingGC)
 {
-    AllocLockHolder lh;
+    NoGCRegionLockHolder lh;
 
     dprintf (1, ("begin no gc called"));
     start_no_gc_region_status status = gc_heap::prepare_for_no_gc_region (totalSize, lohSizeKnown, lohSize, disallowFullBlockingGC);
@@ -35523,7 +35570,7 @@ int GCHeap::StartNoGCRegion(uint64_t totalSize, BOOL lohSizeKnown, uint64_t lohS
 
 int GCHeap::EndNoGCRegion()
 {
-    AllocLockHolder lh;
+    NoGCRegionLockHolder lh;
     return (int)gc_heap::end_no_gc_region();
 }
 
@@ -35768,88 +35815,6 @@ void GCHeap::SetFinalizationRun (Object* obj)
     ((CObjectHeader*)obj)->GetHeader()->SetBit(BIT_SBLK_FINALIZER_RUN);
 }
 
-#endif // FEATURE_PREMORTEM_FINALIZATION
-
-//----------------------------------------------------------------------------
-//
-// Write Barrier Support for bulk copy ("Clone") operations
-//
-// StartPoint is the target bulk copy start point
-// len is the length of the bulk copy (in bytes)
-//
-//
-// Performance Note:
-//
-// This is implemented somewhat "conservatively", that is we
-// assume that all the contents of the bulk copy are object
-// references.  If they are not, and the value lies in the
-// ephemeral range, we will set false positives in the card table.
-//
-// We could use the pointer maps and do this more accurately if necessary
-
-#if defined(_MSC_VER) && defined(_TARGET_X86_)
-#pragma optimize("y", on)        // Small critical routines, don't put in EBP frame 
-#endif //_MSC_VER && _TARGET_X86_
-
-void
-GCHeap::SetCardsAfterBulkCopy( Object **StartPoint, size_t len )
-{
-    Object **rover;
-    Object **end;
-
-    // Target should aligned
-    assert(Aligned ((size_t)StartPoint));
-
-
-    // Don't optimize the Generation 0 case if we are checking for write barrier voilations
-    // since we need to update the shadow heap even in the generation 0 case.
-#if defined (WRITE_BARRIER_CHECK) && !defined (SERVER_GC)
-    if (g_pConfig->GetHeapVerifyLevel() & EEConfig::HEAPVERIFY_BARRIERCHECK)
-        for(unsigned i=0; i < len / sizeof(Object*); i++)
-            updateGCShadow(&StartPoint[i], StartPoint[i]);
-#endif //WRITE_BARRIER_CHECK && !SERVER_GC
-
-#ifdef FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
-    if (SoftwareWriteWatch::IsEnabledForGCHeap())
-    {
-        SoftwareWriteWatch::SetDirtyRegion(StartPoint, len);
-    }
-#endif // FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP
-
-    // If destination is in Gen 0 don't bother
-    if (
-#ifdef BACKGROUND_GC
-        (!gc_heap::settings.concurrent) &&
-#endif //BACKGROUND_GC
-        (g_theGCHeap->WhichGeneration( (Object*) StartPoint ) == 0))
-        return;
-
-    rover = StartPoint;
-    end = StartPoint + (len/sizeof(Object*));
-    while (rover < end)
-    {
-        if ( (((uint8_t*)*rover) >= g_ephemeral_low) && (((uint8_t*)*rover) < g_ephemeral_high) )
-        {
-            // Set Bit For Card and advance to next card
-            size_t card = gcard_of ((uint8_t*)rover);
-
-            Interlocked::Or (&g_card_table[card/card_word_width], (1U << (card % card_word_width)));
-            // Skip to next card for the object
-            rover = (Object**)align_on_card ((uint8_t*)(rover+1));
-        }
-        else
-        {
-            rover++;
-        }
-    }
-}
-
-#if defined(_MSC_VER) && defined(_TARGET_X86_)
-#pragma optimize("", on)        // Go back to command line default optimizations
-#endif //_MSC_VER && _TARGET_X86_
-
-
-#ifdef FEATURE_PREMORTEM_FINALIZATION
 
 //--------------------------------------------------------------------
 //
@@ -36276,21 +36241,17 @@ CFinalize::GcScanRoots (promote_func* fn, int hn, ScanContext *pSC)
     }
 }
 
-#ifdef GC_PROFILING
-void CFinalize::WalkFReachableObjects (gc_heap* hp)
+void CFinalize::WalkFReachableObjects (fq_walk_fn fn)
 {
-    BEGIN_PIN_PROFILER(CORProfilerPresent());
     Object** startIndex = SegQueue (CriticalFinalizerListSeg);
     Object** stopCriticalIndex = SegQueueLimit (CriticalFinalizerListSeg);
     Object** stopIndex  = SegQueueLimit (FinalizerListSeg);
     for (Object** po = startIndex; po < stopIndex; po++)
     {
         //report *po
-        g_profControlBlock.pProfInterface->FinalizeableObjectQueued(po < stopCriticalIndex, (ObjectID)*po);
+        fn(po < stopCriticalIndex, *po);
     }
-    END_PIN_PROFILER();
 }
-#endif //GC_PROFILING
 
 BOOL
 CFinalize::ScanForFinalization (promote_func* pfn, int gen, BOOL mark_only_p,
@@ -36397,7 +36358,7 @@ CFinalize::ScanForFinalization (promote_func* pfn, int gen, BOOL mark_only_p,
         if (hp->settings.concurrent && hp->settings.found_finalizers)
         {
             if (!mark_only_p)
-                FinalizerThread::EnableFinalization();
+                GCToEEInterface::EnableFinalization(true);
         }
     }
 
@@ -36526,8 +36487,7 @@ void CFinalize::CheckFinalizerObjects()
 //                      End of VM specific support
 //
 //------------------------------------------------------------------------------
-
-void gc_heap::walk_heap (walk_fn fn, void* context, int gen_number, BOOL walk_large_object_heap_p)
+void gc_heap::walk_heap_per_heap (walk_fn fn, void* context, int gen_number, BOOL walk_large_object_heap_p)
 {
     generation* gen = gc_heap::generation_of (gen_number);
     heap_segment*    seg = generation_start_segment (gen);
@@ -36583,9 +36543,29 @@ void gc_heap::walk_heap (walk_fn fn, void* context, int gen_number, BOOL walk_la
     }
 }
 
-void GCHeap::WalkObject (Object* obj, walk_fn fn, void* context)
+void gc_heap::walk_finalize_queue (fq_walk_fn fn)
 {
-#if defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
+#ifdef FEATURE_PREMORTEM_FINALIZATION
+    finalize_queue->WalkFReachableObjects (fn);
+#endif //FEATURE_PREMORTEM_FINALIZATION
+}
+
+void gc_heap::walk_heap (walk_fn fn, void* context, int gen_number, BOOL walk_large_object_heap_p)
+{
+#ifdef MULTIPLE_HEAPS
+    for (int hn = 0; hn < gc_heap::n_heaps; hn++)
+    {
+        gc_heap* hp = gc_heap::g_heaps [hn];
+
+        hp->walk_heap_per_heap (fn, context, gen_number, walk_large_object_heap_p);
+    }
+#else
+    walk_heap_per_heap(fn, context, gen_number, walk_large_object_heap_p);
+#endif //MULTIPLE_HEAPS
+}
+
+void GCHeap::DiagWalkObject (Object* obj, walk_fn fn, void* context)
+{
     uint8_t* o = (uint8_t*)obj;
     if (o)
     {
@@ -36600,7 +36580,48 @@ void GCHeap::WalkObject (Object* obj, walk_fn fn, void* context)
                                     }
             );
     }
-#endif //defined(GC_PROFILING) || defined(FEATURE_EVENT_TRACE)
+}
+
+void GCHeap::DiagWalkSurvivorsWithType (void* gc_context, record_surv_fn fn, size_t diag_context, walk_surv_type type)
+{
+    gc_heap* hp = (gc_heap*)gc_context;
+    hp->walk_survivors (fn, diag_context, type);
+}
+
+void GCHeap::DiagWalkHeap (walk_fn fn, void* context, int gen_number, BOOL walk_large_object_heap_p)
+{
+    gc_heap::walk_heap (fn, context, gen_number, walk_large_object_heap_p);
+}
+
+void GCHeap::DiagWalkFinalizeQueue (void* gc_context, fq_walk_fn fn)
+{
+    gc_heap* hp = (gc_heap*)gc_context;
+    hp->walk_finalize_queue (fn);
+}
+
+void GCHeap::DiagScanFinalizeQueue (fq_scan_fn fn, ScanContext* sc)
+{
+#ifdef MULTIPLE_HEAPS
+    for (int hn = 0; hn < gc_heap::n_heaps; hn++)
+    {
+        gc_heap* hp = gc_heap::g_heaps [hn];
+        hp->finalize_queue->GcScanRoots(fn, hn, sc);
+    }
+#else
+        pGenGCHeap->finalize_queue->GcScanRoots(fn, 0, sc);
+#endif //MULTIPLE_HEAPS
+}
+
+void GCHeap::DiagScanHandles (handle_scan_fn fn, int gen_number, ScanContext* context)
+{
+    UNREFERENCED_PARAMETER(gen_number);
+    GCScan::GcScanHandlesForProfilerAndETW (max_generation, context, fn);
+}
+
+void GCHeap::DiagScanDependentHandles (handle_scan_fn fn, int gen_number, ScanContext* context)
+{
+    UNREFERENCED_PARAMETER(gen_number);
+    GCScan::GcScanDependentHandlesForProfilerAndETW (max_generation, context, fn);
 }
 
 // Go through and touch (read) each page straddled by a memory block.
@@ -36647,11 +36668,11 @@ void initGCShadow()
     if (!(g_pConfig->GetHeapVerifyLevel() & EEConfig::HEAPVERIFY_BARRIERCHECK))
         return;
 
-    size_t len = g_highest_address - g_lowest_address;
+    size_t len = g_gc_highest_address - g_gc_lowest_address;
     if (len > (size_t)(g_GCShadowEnd - g_GCShadow)) 
     {
         deleteGCShadow();
-        g_GCShadowEnd = g_GCShadow = (uint8_t *)GCToOSInterface::VirtualReserve(0, len, 0, VirtualReserveFlags::None);
+        g_GCShadowEnd = g_GCShadow = (uint8_t *)GCToOSInterface::VirtualReserve(len, 0, VirtualReserveFlags::None);
         if (g_GCShadow == NULL || !GCToOSInterface::VirtualCommit(g_GCShadow, len))
         {
             _ASSERTE(!"Not enough memory to run HeapVerify level 2");
@@ -36666,10 +36687,10 @@ void initGCShadow()
         g_GCShadowEnd += len;
     }
 
-    // save the value of g_lowest_address at this time.  If this value changes before
+    // save the value of g_gc_lowest_address at this time.  If this value changes before
     // the next call to checkGCWriteBarrier() it means we extended the heap (with a
     // large object segment most probably), and the whole shadow segment is inconsistent.
-    g_shadow_lowest_address = g_lowest_address;
+    g_shadow_lowest_address = g_gc_lowest_address;
 
         //****** Copy the whole GC heap ******
     //
@@ -36679,7 +36700,7 @@ void initGCShadow()
     generation* gen = gc_heap::generation_of (max_generation);
     heap_segment* seg = heap_segment_rw (generation_start_segment (gen));
 
-    ptrdiff_t delta = g_GCShadow - g_lowest_address;
+    ptrdiff_t delta = g_GCShadow - g_gc_lowest_address;
     BOOL small_object_segments = TRUE;
     while(1)
     {
@@ -36707,7 +36728,7 @@ void initGCShadow()
     // test to see if 'ptr' was only updated via the write barrier.
 inline void testGCShadow(Object** ptr)
 {
-    Object** shadow = (Object**) &g_GCShadow[((uint8_t*) ptr - g_lowest_address)];
+    Object** shadow = (Object**) &g_GCShadow[((uint8_t*) ptr - g_gc_lowest_address)];
     if (*ptr != 0 && (uint8_t*) shadow < g_GCShadowEnd && *ptr != *shadow)
     {
 
@@ -36766,9 +36787,9 @@ void testGCShadowHelper (uint8_t* x)
     // Walk the whole heap, looking for pointers that were not updated with the write barrier.
 void checkGCWriteBarrier()
 {
-    // g_shadow_lowest_address != g_lowest_address means the GC heap was extended by a segment
+    // g_shadow_lowest_address != g_gc_lowest_address means the GC heap was extended by a segment
     // and the GC shadow segment did not track that change!
-    if (g_GCShadowEnd <= g_GCShadow || g_shadow_lowest_address != g_lowest_address)
+    if (g_GCShadowEnd <= g_GCShadow || g_shadow_lowest_address != g_gc_lowest_address)
     {
         // No shadow stack, nothing to check.
         return;
@@ -36894,4 +36915,56 @@ BOOL GCHeap::IsConcurrentGCEnabled()
 #else
     return FALSE;
 #endif //BACKGROUND_GC
+}
+
+void GCHeap::SetFinalizeRunOnShutdown(bool value)
+{
+    g_fFinalizerRunOnShutDown = value;
+}
+
+void PopulateDacVars(GcDacVars *gcDacVars)
+{
+#ifndef DACCESS_COMPILE
+    assert(gcDacVars != nullptr);
+    *gcDacVars = {};
+    gcDacVars->major_version_number = 1;
+    gcDacVars->minor_version_number = 0;
+    gcDacVars->built_with_svr = &g_built_with_svr_gc;
+    gcDacVars->build_variant = &g_build_variant;
+    gcDacVars->gc_structures_invalid_cnt = const_cast<int32_t*>(&GCScan::m_GcStructuresInvalidCnt);
+    gcDacVars->generation_size = sizeof(generation);
+#ifdef FEATURE_SVR_GC
+    gcDacVars->gc_heap_type = &IGCHeap::gcHeapType;
+#endif // FEATURE_SVR_GC
+    gcDacVars->max_gen = &IGCHeap::maxGeneration;
+#ifndef MULTIPLE_HEAPS
+    gcDacVars->mark_array = &gc_heap::mark_array;
+    gcDacVars->ephemeral_heap_segment = reinterpret_cast<dac_heap_segment**>(&gc_heap::ephemeral_heap_segment);
+    gcDacVars->current_c_gc_state = const_cast<c_gc_state*>(&gc_heap::current_c_gc_state);
+    gcDacVars->saved_sweep_ephemeral_seg = reinterpret_cast<dac_heap_segment**>(&gc_heap::saved_sweep_ephemeral_seg);
+    gcDacVars->saved_sweep_ephemeral_start = &gc_heap::saved_sweep_ephemeral_start;
+    gcDacVars->background_saved_lowest_address = &gc_heap::background_saved_lowest_address;
+    gcDacVars->background_saved_highest_address = &gc_heap::background_saved_highest_address;
+    gcDacVars->alloc_allocated = &gc_heap::alloc_allocated;
+    gcDacVars->next_sweep_obj = &gc_heap::next_sweep_obj;
+    gcDacVars->oom_info = &gc_heap::oom_info;
+    gcDacVars->finalize_queue = reinterpret_cast<dac_finalize_queue**>(&gc_heap::finalize_queue);
+    gcDacVars->generation_table = reinterpret_cast<dac_generation**>(&gc_heap::generation_table);
+#ifdef GC_CONFIG_DRIVEN
+    gcDacVars->gc_global_mechanisms = reinterpret_cast<size_t**>(&gc_global_mechanisms);
+    gcDacVars->interesting_data_per_heap = reinterpret_cast<size_t**>(&gc_heap::interesting_data_per_heap);
+    gcDacVars->compact_reasons_per_heap = reinterpret_cast<size_t**>(&gc_heap::compact_reasons_per_heap);
+    gcDacVars->expand_mechanisms_per_heap = reinterpret_cast<size_t**>(&gc_heap::expand_mechanisms_per_heap);
+    gcDacVars->interesting_mechanism_bits_per_heap = reinterpret_cast<size_t**>(&gc_heap::interesting_mechanism_bits_per_heap);
+#endif // GC_CONFIG_DRIVEN
+#ifdef HEAP_ANALYZE
+    gcDacVars->internal_root_array = &gc_heap::internal_root_array;
+    gcDacVars->internal_root_array_index = &gc_heap::internal_root_array_index;
+    gcDacVars->heap_analyze_success = &gc_heap::heap_analyze_success;
+#endif // HEAP_ANALYZE
+#else
+    gcDacVars->n_heaps = &gc_heap::n_heaps;
+    gcDacVars->g_heaps = reinterpret_cast<dac_gc_heap***>(&gc_heap::g_heaps);
+#endif // MULTIPLE_HEAPS
+#endif // DACCESS_COMPILE
 }

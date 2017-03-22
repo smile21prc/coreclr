@@ -26,21 +26,11 @@ IGCHeapInternal* g_theGCHeap;
 IGCToCLR* g_theGCToCLR;
 #endif // FEATURE_STANDALONE_GC
 
-/* global versions of the card table and brick table */ 
-GPTR_IMPL(uint32_t,g_card_table);
-
-/* absolute bounds of the GC memory */
-GPTR_IMPL_INIT(uint8_t,g_lowest_address,0);
-GPTR_IMPL_INIT(uint8_t,g_highest_address,0);
-
 #ifdef GC_CONFIG_DRIVEN
-GARY_IMPL(size_t, gc_global_mechanisms, MAX_GLOBAL_GC_MECHANISMS_COUNT);
+size_t gc_global_mechanisms[MAX_GLOBAL_GC_MECHANISMS_COUNT];
 #endif //GC_CONFIG_DRIVEN
 
 #ifndef DACCESS_COMPILE
-
-uint8_t* g_ephemeral_low = (uint8_t*)1;
-uint8_t* g_ephemeral_high = (uint8_t*)~0;
 
 #ifdef WRITE_BARRIER_CHECK
 uint8_t* g_GCShadow;
@@ -48,12 +38,19 @@ uint8_t* g_GCShadowEnd;
 uint8_t* g_shadow_lowest_address = NULL;
 #endif
 
-VOLATILE(int32_t) m_GCLock = -1;
+uint32_t* g_gc_card_table;
+
+#ifdef FEATURE_MANUALLY_MANAGED_CARD_BUNDLES
+uint32_t* g_gc_card_bundle_table;
+#endif
+
+uint8_t* g_gc_lowest_address  = 0;
+uint8_t* g_gc_highest_address = 0;
 
 #ifdef GC_CONFIG_DRIVEN
 void record_global_mechanism (int mech_index)
 {
-	(gc_global_mechanisms[mech_index])++;
+    (gc_global_mechanisms[mech_index])++;
 }
 #endif //GC_CONFIG_DRIVEN
 
@@ -138,17 +135,47 @@ void InitializeHeapType(bool bServerHeap)
 #endif // FEATURE_SVR_GC
 }
 
-IGCHeap* InitializeGarbageCollector(IGCToCLR* clrToGC)
+namespace WKS 
+{
+    extern void PopulateDacVars(GcDacVars* dacVars);
+}
+
+namespace SVR
+{
+    extern void PopulateDacVars(GcDacVars* dacVars);
+}
+
+bool InitializeGarbageCollector(IGCToCLR* clrToGC, IGCHeap** gcHeap, GcDacVars* gcDacVars)
 {
     LIMITED_METHOD_CONTRACT;
 
     IGCHeapInternal* heap;
+
+    assert(gcDacVars != nullptr);
+    assert(gcHeap != nullptr);
 #ifdef FEATURE_SVR_GC
     assert(IGCHeap::gcHeapType != IGCHeap::GC_HEAP_INVALID);
-    heap = IGCHeap::gcHeapType == IGCHeap::GC_HEAP_SVR ? SVR::CreateGCHeap() : WKS::CreateGCHeap();
+
+    if (IGCHeap::gcHeapType == IGCHeap::GC_HEAP_SVR)
+    {
+        heap = SVR::CreateGCHeap();
+        SVR::PopulateDacVars(gcDacVars);
+    }
+    else
+    {
+        heap = WKS::CreateGCHeap();
+        WKS::PopulateDacVars(gcDacVars);
+    }
 #else
     heap = WKS::CreateGCHeap();
+    WKS::PopulateDacVars(gcDacVars);
+
 #endif
+
+    if (heap == nullptr)
+    {
+        return false;
+    }
 
     g_theGCHeap = heap;
 
@@ -156,10 +183,12 @@ IGCHeap* InitializeGarbageCollector(IGCToCLR* clrToGC)
     assert(clrToGC != nullptr);
     g_theGCToCLR = clrToGC;
 #else
+    UNREFERENCED_PARAMETER(clrToGC);
     assert(clrToGC == nullptr);
 #endif
 
-    return heap;
+    *gcHeap = heap;
+    return true;
 }
 
 #endif // !DACCESS_COMPILE

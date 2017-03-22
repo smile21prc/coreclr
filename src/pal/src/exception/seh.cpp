@@ -27,7 +27,7 @@ Abstract:
 #include "pal/init.h"
 #include "pal/process.h"
 #include "pal/malloc.hpp"
-#include "signal.hpp"
+#include "pal/signal.hpp"
 
 #if HAVE_MACH_EXCEPTIONS
 #include "machexception.h"
@@ -226,7 +226,11 @@ Parameters:
     PAL_SEHException* ex - the exception to throw.
 --*/
 extern "C"
+#ifdef _X86_
+void __fastcall ThrowExceptionHelper(PAL_SEHException* ex)
+#else // _X86_
 void ThrowExceptionHelper(PAL_SEHException* ex)
+#endif // !_X86_
 {
     throw std::move(*ex);
 }
@@ -274,7 +278,7 @@ SEHProcessException(PAL_SEHException* exception)
                     {
                         // The exception happened in the page right below the stack limit,
                         // so it is a stack overflow
-                        write(STDERR_FILENO, StackOverflowMessage, sizeof(StackOverflowMessage) - 1);
+                        (void)write(STDERR_FILENO, StackOverflowMessage, sizeof(StackOverflowMessage) - 1);
                         PROCAbort();
                     }
                 }

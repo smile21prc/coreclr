@@ -397,9 +397,9 @@ inline LPVOID PushedRegAddr(REGDISPLAY* pRD, LPVOID pAddr)
 {
     LIMITED_METHOD_CONTRACT;
 
-#if defined(_TARGET_AMD64_)
+#ifdef WIN64EXCEPTIONS
     if ( ((UINT_PTR)(pAddr) >= (UINT_PTR)pRD->pCurrentContextPointers) &&
-         ((UINT_PTR)(pAddr) <= ((UINT_PTR)pRD->pCurrentContextPointers + sizeof(_KNONVOLATILE_CONTEXT_POINTERS))) )
+         ((UINT_PTR)(pAddr) <= ((UINT_PTR)pRD->pCurrentContextPointers + sizeof(T_KNONVOLATILE_CONTEXT_POINTERS))) )
 #else
     if ( ((UINT_PTR)(pAddr) >= (UINT_PTR)pRD->pContext) &&
          ((UINT_PTR)(pAddr) <= ((UINT_PTR)pRD->pContext + sizeof(T_CONTEXT))) )
@@ -2772,8 +2772,6 @@ public:
 
     bool ResumeThreads(AppDomain* pAppDomain);
 
-    static DWORD WaitForSingleObjectHelper(HANDLE handle, DWORD dwMilliseconds);
-
     void ProcessAnyPendingEvals(Thread *pThread);
 
     bool HasLazyData();
@@ -3512,10 +3510,10 @@ public:
  * ------------------------------------------------------------------------ */
 
 class InteropSafe {};
-#define interopsafe (*(InteropSafe*)NULL)
+extern InteropSafe interopsafe;
 
 class InteropSafeExecutable {};
-#define interopsafeEXEC (*(InteropSafeExecutable*)NULL)
+extern InteropSafeExecutable interopsafeEXEC;
 
 #ifndef DACCESS_COMPILE
 inline void * __cdecl operator new(size_t n, const InteropSafe&)

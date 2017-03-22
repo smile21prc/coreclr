@@ -236,6 +236,20 @@ void interceptor_ICJI::getMethodVTableOffset (
     mc->recGetMethodVTableOffset(method, offsetOfIndirection, offsetAfterIndirection);
 }
 
+// Find the virtual method in implementingClass that overrides virtualMethod.
+// Return null if devirtualization is not possible.
+CORINFO_METHOD_HANDLE interceptor_ICJI::resolveVirtualMethod(
+    CORINFO_METHOD_HANDLE virtualMethod,
+    CORINFO_CLASS_HANDLE implementingClass,
+    CORINFO_CONTEXT_HANDLE ownerType
+    )
+{
+    mc->cr->AddCall("resolveVirtualMethod");
+    CORINFO_METHOD_HANDLE result = original_ICorJitInfo->resolveVirtualMethod(virtualMethod, implementingClass, ownerType);
+    mc->recResolveVirtualMethod(virtualMethod, implementingClass, ownerType, result);
+    return result;
+}
+
 // If a method's attributes have (getMethodAttribs) CORINFO_FLG_INTRINSIC set,
 // getIntrinsicID() returns the intrinsic ID.
 CorInfoIntrinsics interceptor_ICJI::getIntrinsicID(
@@ -1173,7 +1187,7 @@ bool interceptor_ICJI::isFieldStatic(CORINFO_FIELD_HANDLE fldHnd)
 // in the code are.  The native compiler will ensure that these places
 // have a corresponding break point in native code.
 //
-// Note that unless CORJIT_FLG_DEBUG_CODE is specified, this function will
+// Note that unless CORJIT_FLAG_DEBUG_CODE is specified, this function will
 // be used only as a hint and the native compiler should not change its
 // code generation.
 void interceptor_ICJI::getBoundaries(
@@ -1214,7 +1228,7 @@ void interceptor_ICJI::setBoundaries(
 // under debugging, the JIT needs to keep them live over their
 // entire scope so that they can be inspected.
 //
-// Note that unless CORJIT_FLG_DEBUG_CODE is specified, this function will
+// Note that unless CORJIT_FLAG_DEBUG_CODE is specified, this function will
 // be used only as a hint and the native compiler should not change its
 // code generation.
 void interceptor_ICJI::getVars(
@@ -1388,7 +1402,9 @@ CorInfoType interceptor_ICJI::getHFAType (
         )
 {
     mc->cr->AddCall("getHFAType");
-    return original_ICorJitInfo->getHFAType(hClass);
+    CorInfoType temp = original_ICorJitInfo->getHFAType(hClass);
+    this->mc->recGetHFAType(hClass, temp);
+    return temp;
 }
 
 /*****************************************************************************

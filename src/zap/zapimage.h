@@ -557,6 +557,8 @@ private:
     void OutputEntrypointsTableForReadyToRun();
     void OutputDebugInfoForReadyToRun();
     void OutputTypesTableForReadyToRun(IMDInternalImport * pMDImport);
+    void OutputInliningTableForReadyToRun();
+    void OutputProfileDataForReadyToRun();
 
     void CopyDebugDirEntry();
     void CopyWin32VersionResource();
@@ -656,7 +658,7 @@ public:
                          NOT_COMPILED    =  0, COMPILE_EXCLUDED =  1,       // Info
                          COMPILE_SUCCEED = 10, ALREADY_COMPILED = 11};      // Success
 
-    static void __stdcall TryCompileMethodStub(LPVOID pContext, CORINFO_METHOD_HANDLE hStub, DWORD dwJitFlags);
+    static void __stdcall TryCompileMethodStub(LPVOID pContext, CORINFO_METHOD_HANDLE hStub, CORJIT_FLAGS jitFlags);
 
     BOOL IsVTableGapMethod(mdMethodDef md);
 

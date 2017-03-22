@@ -8,7 +8,7 @@
 #if defined(__APPLE__)
         .cfi_personality 0x9b, C_FUNC(\Handler) // 0x9b == DW_EH_PE_indirect | DW_EH_PE_pcrel | DW_EH_PE_sdata4
 #else
-        .cfi_personality 0, C_FUNC(\Handler) // 0 == DW_EH_PE_absptr
+        .cfi_personality 0x1b, C_FUNC(\Handler) // 0x1b == DW_EH_PE_pcrel | DW_EH_PE_sdata4
 #endif
         .endif
 .endm
@@ -53,6 +53,15 @@ C_FUNC(\Name):
 C_FUNC(\Name\()_End):
         .global C_FUNC(\Name\()_End)
         LEAF_END \Name, \Section
+.endm
+
+.macro NOP_6_BYTE
+        .byte 0x66
+        .byte 0x0F
+        .byte 0x1F
+        .byte 0x44
+        .byte 0x00
+        .byte 0x00
 .endm
 
 .macro NOP_3_BYTE

@@ -17,14 +17,10 @@
 #include "eeconfig.h"
 #include "dllimport.h"
 #include "comdelegate.h"
-#ifdef FEATURE_REMOTING
-#include "remoting.h"
-#endif
 #include "dbginterface.h"
 #include "listlock.inl"
 #include "stubgen.h"
 #include "eventtrace.h"
-#include "constrainedexecutionregion.h"
 #include "array.h"
 #include "compile.h"
 #include "ecall.h"
@@ -256,7 +252,7 @@ void DACNotifyCompilationFinished(MethodDesc *methodDesc)
 // which prevents us from trying to JIT the same method more that once.
 
 
-PCODE MethodDesc::MakeJitWorker(COR_ILMETHOD_DECODER* ILHeader, DWORD flags, DWORD flags2)
+PCODE MethodDesc::MakeJitWorker(COR_ILMETHOD_DECODER* ILHeader, CORJIT_FLAGS flags)
 {
     STANDARD_VM_CONTRACT;
 
@@ -280,7 +276,7 @@ PCODE MethodDesc::MakeJitWorker(COR_ILMETHOD_DECODER* ILHeader, DWORD flags, DWO
 #ifdef FEATURE_MULTICOREJIT
     MulticoreJitManager & mcJitManager = GetAppDomain()->GetMulticoreJitManager();
 
-    bool fBackgroundThread = (flags & CORJIT_FLG_MCJIT_BACKGROUND) != 0;
+    bool fBackgroundThread = flags.IsSet(CORJIT_FLAGS::CORJIT_FLAG_MCJIT_BACKGROUND);
 #endif
 
     {
@@ -424,22 +420,30 @@ PCODE MethodDesc::MakeJitWorker(COR_ILMETHOD_DECODER* ILHeader, DWORD flags, DWO
             {
                 BEGIN_PIN_PROFILER(CORProfilerTrackJITInfo());
 
+#ifdef FEATURE_MULTICOREJIT
                 // Multicore JIT should be disabled when CORProfilerTrackJITInfo is on
                 // But there could be corner case in which profiler is attached when multicore background thread is calling MakeJitWorker
                 // Disable this block when calling from multicore JIT background thread
-                if (!IsNoMetadata()
-#ifdef FEATURE_MULTICOREJIT
-
-                    && (! fBackgroundThread)
+                if (!fBackgroundThread)
 #endif
-                    )
                 {
-                    g_profControlBlock.pProfInterface->JITCompilationStarted((FunctionID) this, TRUE);
-                    // The profiler may have changed the code on the callback.  Need to
-                    // pick up the new code.  Note that you have to be fully trusted in
-                    // this mode and the code will not be verified.
-                    COR_ILMETHOD *pilHeader = GetILHeader(TRUE);
-                    new (ILHeader) COR_ILMETHOD_DECODER(pilHeader, GetMDImport(), NULL);
+                    if (!IsNoMetadata())
+                    {
+                        g_profControlBlock.pProfInterface->JITCompilationStarted((FunctionID) this, TRUE);
+                        // The profiler may have changed the code on the callback.  Need to
+                        // pick up the new code.  Note that you have to be fully trusted in
+                        // this mode and the code will not be verified.
+                        COR_ILMETHOD *pilHeader = GetILHeader(TRUE);
+                        new (ILHeader) COR_ILMETHOD_DECODER(pilHeader, GetMDImport(), NULL);
+                    }
+                    else
+                    {
+                        unsigned int ilSize, unused;
+                        CorInfoOptions corOptions;
+                        LPCBYTE ilHeaderPointer = this->AsDynamicMethodDesc()->GetResolver()->GetCodeInfo(&ilSize, &unused, &corOptions, &unused);
+
+                        g_profControlBlock.pProfInterface->DynamicMethodJITCompilationStarted((FunctionID) this, TRUE, ilHeaderPointer, ilSize);
+                    }
                 }
                 END_PIN_PROFILER();
             }
@@ -457,13 +461,13 @@ PCODE MethodDesc::MakeJitWorker(COR_ILMETHOD_DECODER* ILHeader, DWORD flags, DWO
             if (!fBackgroundThread)
 #endif // FEATURE_MULTICOREJIT
             {
-                StackSampler::RecordJittingInfo(this, flags, flags2);
+                StackSampler::RecordJittingInfo(this, flags);
             }
 #endif // FEATURE_STACK_SAMPLING
 
             EX_TRY
             {
-                pCode = UnsafeJitFunction(this, ILHeader, flags, flags2, &sizeOfCode);
+                pCode = UnsafeJitFunction(this, ILHeader, flags, &sizeOfCode);
             }
             EX_CATCH
             {
@@ -593,6 +597,10 @@ GotNewCode:
                                                 pEntry->m_hrResultCode, 
                                                 TRUE);
                 }
+                else
+                {
+                    g_profControlBlock.pProfInterface->DynamicMethodJITCompilationFinished((FunctionID) this, pEntry->m_hrResultCode, TRUE);
+                }
                 END_PIN_PROFILER();
             }
 #endif // PROFILING_SUPPORTED
@@ -720,14 +728,22 @@ Stub * CreateUnboxingILStubForSharedGenericValueTypeMethods(MethodDesc* pTargetM
 
     // 2. Emit the method body
     mdToken tokPinningHelper = pCode->GetToken(MscorlibBinder::GetField(FIELD__PINNING_HELPER__M_DATA));
-    
+
     // 2.1 Push the thisptr
     // We need to skip over the MethodTable*
-    // The trick below will do that. 
+    // The trick below will do that.
     pCode->EmitLoadThis();
     pCode->EmitLDFLDA(tokPinningHelper);
 
-    // 2.2 Push the hidden context param 
+#if defined(_TARGET_X86_)
+    // 2.2 Push the rest of the arguments for x86
+    for (unsigned i = 0; i < msig.NumFixedArgs();i++)
+    {
+        pCode->EmitLDARG(i);
+    }
+#endif
+
+    // 2.3 Push the hidden context param
     // The context is going to be captured from the thisptr
     pCode->EmitLoadThis();
     pCode->EmitLDFLDA(tokPinningHelper);
@@ -735,16 +751,18 @@ Stub * CreateUnboxingILStubForSharedGenericValueTypeMethods(MethodDesc* pTargetM
     pCode->EmitSUB();
     pCode->EmitLDIND_I();
 
-    // 2.3 Push the rest of the arguments
+#if !defined(_TARGET_X86_)
+    // 2.4 Push the rest of the arguments for not x86
     for (unsigned i = 0; i < msig.NumFixedArgs();i++)
     {
         pCode->EmitLDARG(i);
     }
+#endif
 
-    // 2.4 Push the target address
+    // 2.5 Push the target address
     pCode->EmitLDC((TADDR)pTargetMD->GetMultiCallableAddrOfCode(CORINFO_ACCESS_ANY));
 
-    // 2.5 Do the calli
+    // 2.6 Do the calli
     pCode->EmitCALLI(TOKEN_ILSTUB_TARGET_SIG, msig.NumFixedArgs() + 1, msig.IsReturnTypeVoid() ? 0 : 1);
     pCode->EmitRET();
 
@@ -823,20 +841,30 @@ Stub * CreateInstantiatingILStub(MethodDesc* pTargetMD, void* pHiddenArg)
         pCode->EmitLoadThis();
     }
 
-    // 2.2 Push the hidden context param 
-    // InstantiatingStub
-    pCode->EmitLDC((TADDR)pHiddenArg);
-
-    // 2.3 Push the rest of the arguments
+#if defined(_TARGET_X86_)
+    // 2.2 Push the rest of the arguments for x86
     for (unsigned i = 0; i < msig.NumFixedArgs();i++)
     {
         pCode->EmitLDARG(i);
     }
+#endif // _TARGET_X86_
 
-    // 2.4 Push the target address
+    // 2.3 Push the hidden context param
+    // InstantiatingStub
+    pCode->EmitLDC((TADDR)pHiddenArg);
+
+#if !defined(_TARGET_X86_)
+    // 2.4 Push the rest of the arguments for not x86
+    for (unsigned i = 0; i < msig.NumFixedArgs();i++)
+    {
+        pCode->EmitLDARG(i);
+    }
+#endif // !_TARGET_X86_
+
+    // 2.5 Push the target address
     pCode->EmitLDC((TADDR)pTargetMD->GetMultiCallableAddrOfCode(CORINFO_ACCESS_ANY));
 
-    // 2.5 Do the calli
+    // 2.6 Do the calli
     pCode->EmitCALLI(TOKEN_ILSTUB_TARGET_SIG, msig.NumFixedArgs() + 1, msig.IsReturnTypeVoid() ? 0 : 1);
     pCode->EmitRET();
 
@@ -1203,12 +1231,6 @@ PCODE MethodDesc::DoPrestub(MethodTable *pDispatchingMT)
         RETURN GetStableEntryPoint();
     }
 
-#ifdef FEATURE_PREJIT 
-    // If this method is the root of a CER call graph and we've recorded this fact in the ngen image then we're in the prestub in
-    // order to trip any runtime level preparation needed for this graph (P/Invoke stub generation/library binding, generic
-    // dictionary prepopulation etc.).
-    GetModule()->RestoreCer(this);
-#endif // FEATURE_PREJIT
 
 #ifdef FEATURE_COMINTEROP 
     /**************************   INTEROP   *************************/
@@ -1271,13 +1293,6 @@ PCODE MethodDesc::DoPrestub(MethodTable *pDispatchingMT)
     {
         pStub = MakeUnboxingStubWorker(this);
     }
-#ifdef FEATURE_REMOTING
-    else if (pMT->IsInterface() && !IsStatic() && !IsFCall())
-    {
-        pCode = CRemotingServices::GetDispatchInterfaceHelper(this);
-        GetOrCreatePrecode();
-    }
-#endif // FEATURE_REMOTING
 #if defined(FEATURE_SHARE_GENERIC_CODE) 
     else if (IsInstantiatingStub())
     {
@@ -1455,7 +1470,7 @@ PCODE MethodDesc::DoPrestub(MethodTable *pDispatchingMT)
             // Mark the code as hot in case the method ends up in the native image
             g_IBCLogger.LogMethodCodeAccess(this);
 
-            pCode = MakeJitWorker(pHeader, 0, 0);
+            pCode = MakeJitWorker(pHeader, CORJIT_FLAGS());
 
 #ifdef FEATURE_INTERPRETER
             if ((pCode != NULL) && !HasStableEntryPoint())
@@ -1546,24 +1561,6 @@ PCODE MethodDesc::DoPrestub(MethodTable *pDispatchingMT)
     // stub that performs declarative checks prior to calling the real stub.
     // record if security needs to intercept this call (also depends on whether we plan to use stubs for declarative security)
 
-#if !defined( HAS_REMOTING_PRECODE) && defined (FEATURE_REMOTING)
-    /**************************   REMOTING   *************************/
-
-    // check for MarshalByRef scenarios ... we need to intercept
-    // Non-virtual calls on MarshalByRef types
-    if (fRemotingIntercepted)
-    {
-        // let us setup a remoting stub to intercept all the calls
-        Stub *pRemotingStub = CRemotingServices::GetStubForNonVirtualMethod(this, 
-            (pStub != NULL) ? (LPVOID)pStub->GetEntryPoint() : (LPVOID)pCode, pStub);
-        
-        if (pRemotingStub != NULL)
-        {
-            pStub = pRemotingStub;
-            pCode = NULL;
-        }
-    }
-#endif // HAS_REMOTING_PRECODE
 
     _ASSERTE((pStub != NULL) ^ (pCode != NULL));
 
@@ -1596,6 +1593,7 @@ PCODE MethodDesc::DoPrestub(MethodTable *pDispatchingMT)
             else
 #endif // FEATURE_INTERPRETER
             {
+                ReJitPublishMethodHolder publishWorker(this, pCode);
                 SetStableEntryPointInterlocked(pCode);
             }
         }
@@ -1635,9 +1633,9 @@ PCODE MethodDesc::DoPrestub(MethodTable *pDispatchingMT)
 // use the prestub.
 //==========================================================================
 
-#ifdef _TARGET_X86_
+#if defined(_TARGET_X86_) && !defined(FEATURE_STUBS_AS_IL)
 static PCODE g_UMThunkPreStub;
-#endif
+#endif // _TARGET_X86_ && !FEATURE_STUBS_AS_IL
 
 #ifndef DACCESS_COMPILE 
 
@@ -1664,9 +1662,9 @@ void InitPreStubManager(void)
         return;
     }
 
-#ifdef _TARGET_X86_
+#if defined(_TARGET_X86_) && !defined(FEATURE_STUBS_AS_IL)
     g_UMThunkPreStub = GenerateUMThunkPrestub()->GetEntryPoint();
-#endif
+#endif // _TARGET_X86_ && !FEATURE_STUBS_AS_IL
 
     ThePreStubManager::Init();
 }
@@ -1675,11 +1673,11 @@ PCODE TheUMThunkPreStub()
 {
     LIMITED_METHOD_CONTRACT;
 
-#ifdef _TARGET_X86_
+#if defined(_TARGET_X86_) && !defined(FEATURE_STUBS_AS_IL)
     return g_UMThunkPreStub;
-#else
+#else  // _TARGET_X86_ && !FEATURE_STUBS_AS_IL
     return GetEEFuncEntryPoint(TheUMEntryPrestub);
-#endif
+#endif // _TARGET_X86_ && !FEATURE_STUBS_AS_IL
 }
 
 PCODE TheVarargNDirectStub(BOOL hasRetBuffArg)

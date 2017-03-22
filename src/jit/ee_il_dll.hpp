@@ -21,7 +21,7 @@ class CILJit : public ICorJitCompiler
     void getVersionIdentifier(GUID* versionIdentifier /* OUT */
                               );
 
-    unsigned getMaxIntrinsicSIMDVectorLength(DWORD cpuCompileFlags);
+    unsigned getMaxIntrinsicSIMDVectorLength(CORJIT_FLAGS cpuCompileFlags);
 
     void setRealJit(ICorJitCompiler* realJitCompiler);
 };

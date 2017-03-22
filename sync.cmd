@@ -24,6 +24,15 @@ echo                 -AzureToken="Access token"
 echo              To download a specific group of product packages, specify:
 echo                 -BuildMajor
 echo                 -BuildMinor
+echo              To download from a specific container, specify:
+echo                 -Container="container name"
+echo     -n     - Downloads test native binaries from the specified container
+echo              The following properties are required:
+echo                 -AzureAccount="Account name"
+echo                 -AzureToken="Access token"
+echo                 -Container="Container name"
+echo                 -RuntimeId="RID" (Needs to match what's in the container)
+echo.
 echo.
 echo.
 echo If no option is specified then sync.cmd -p is implied.

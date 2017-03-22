@@ -473,10 +473,17 @@ inline unsigned Compiler::funGetFuncIdx(BasicBlock* block)
 
 #endif // !FEATURE_EH_FUNCLETS
 
-/*****************************************************************************
- *
- *  Map a register mask to a register number
- */
+//------------------------------------------------------------------------------
+// genRegNumFromMask : Maps a single register mask to a register number.
+//
+// Arguments:
+//    mask - the register mask
+//
+// Return Value:
+//    The number of the register contained in the mask.
+//
+// Assumptions:
+//    The mask contains one and only one register.
 
 inline regNumber genRegNumFromMask(regMaskTP mask)
 {
@@ -491,6 +498,52 @@ inline regNumber genRegNumFromMask(regMaskTP mask)
     assert(genRegMask(regNum) == mask);
 
     return regNum;
+}
+
+//------------------------------------------------------------------------------
+// genTypeCanRepresentValue: Checks if a value can be represented by a given type.
+//
+// Arguments:
+//    value - the value to check
+//    type  - the type
+//
+// Return Value:
+//    True if the value is representable, false otherwise.
+//
+// Notes:
+//    If the type is not integral or ref like (ref/byref/array) then false is
+//    always returned.
+
+template <typename TValue>
+inline bool genTypeCanRepresentValue(var_types type, TValue value)
+{
+    switch (type)
+    {
+        case TYP_UBYTE:
+        case TYP_BOOL:
+            return FitsIn<UINT8>(value);
+        case TYP_BYTE:
+            return FitsIn<INT8>(value);
+        case TYP_USHORT:
+        case TYP_CHAR:
+            return FitsIn<UINT16>(value);
+        case TYP_SHORT:
+            return FitsIn<INT16>(value);
+        case TYP_UINT:
+            return FitsIn<UINT32>(value);
+        case TYP_INT:
+            return FitsIn<INT32>(value);
+        case TYP_ULONG:
+            return FitsIn<UINT64>(value);
+        case TYP_LONG:
+            return FitsIn<INT64>(value);
+        case TYP_REF:
+        case TYP_BYREF:
+        case TYP_ARRAY:
+            return FitsIn<UINT_PTR>(value);
+        default:
+            return false;
+    }
 }
 
 /*****************************************************************************
@@ -768,7 +821,8 @@ inline double getR8LittleEndian(const BYTE* ptr)
 
 /*****************************************************************************
  *
- *  Return the bitmask to use in the EXPSET_TP for the CSE with the given CSE index.
+ *  Return the normalized index to use in the EXPSET_TP for the CSE with
+ *  the given CSE index.
  *  Each GenTree has the following field:
  *    signed char       gtCSEnum;        // 0 or the CSE index (negated if def)
  *  So zero is reserved to mean this node is not a CSE
@@ -777,15 +831,15 @@ inline double getR8LittleEndian(const BYTE* ptr)
  *  This precondition is checked by the assert on the first line of this method.
  */
 
-inline EXPSET_TP genCSEnum2bit(unsigned index)
+inline unsigned int genCSEnum2bit(unsigned index)
 {
     assert((index > 0) && (index <= EXPSET_SZ));
 
-    return ((EXPSET_TP)1 << (index - 1));
+    return (index - 1);
 }
 
 #ifdef DEBUG
-const char* genES2str(EXPSET_TP set);
+const char* genES2str(BitVecTraits* traits, EXPSET_TP set);
 const char* refCntWtd2str(unsigned refCntWtd);
 #endif
 
@@ -1129,7 +1183,6 @@ inline GenTreePtr Compiler::gtNewFieldRef(
     tree->gtField.gtFldObj    = obj;
     tree->gtField.gtFldHnd    = fldHnd;
     tree->gtField.gtFldOffset = offset;
-    tree->gtFlags |= GTF_GLOB_REF;
 
 #ifdef FEATURE_READYTORUN_COMPILER
     tree->gtField.gtFieldLookup.addr = nullptr;
@@ -1146,6 +1199,18 @@ inline GenTreePtr Compiler::gtNewFieldRef(
     {
         unsigned lclNum                  = obj->gtOp.gtOp1->gtLclVarCommon.gtLclNum;
         lvaTable[lclNum].lvFieldAccessed = 1;
+#if defined(_TARGET_AMD64_) || defined(_TARGET_ARM64_)
+        // These structs are passed by reference; we should probably be able to treat these
+        // as non-global refs, but downstream logic expects these to be marked this way.
+        if (lvaTable[lclNum].lvIsParam)
+        {
+            tree->gtFlags |= GTF_GLOB_REF;
+        }
+#endif // defined(_TARGET_AMD64_) || defined(_TARGET_ARM64_)
+    }
+    else
+    {
+        tree->gtFlags |= GTF_GLOB_REF;
     }
 
     return tree;
@@ -2134,11 +2199,14 @@ inline bool Compiler::lvaKeepAliveAndReportThis()
         return false;
     }
 
+    const bool genericsContextIsThis = (info.compMethodInfo->options & CORINFO_GENERICS_CTXT_FROM_THIS) != 0;
+
 #ifdef JIT32_GCENCODER
+
     if (info.compFlags & CORINFO_FLG_SYNCH)
         return true;
 
-    if (info.compMethodInfo->options & CORINFO_GENERICS_CTXT_FROM_THIS)
+    if (genericsContextIsThis)
     {
         // TODO: Check if any of the exception clauses are
         // typed using a generic type. Else, we do not need to report this.
@@ -2148,18 +2216,29 @@ inline bool Compiler::lvaKeepAliveAndReportThis()
         if (opts.compDbgCode)
             return true;
 
-        if (lvaGenericsContextUsed)
+        if (lvaGenericsContextUseCount > 0)
+        {
+            JITDUMP("Reporting this as generic context: %u refs\n", lvaGenericsContextUseCount);
             return true;
+        }
     }
 #else // !JIT32_GCENCODER
     // If the generics context is the this pointer we need to report it if either
     // the VM requires us to keep the generics context alive or it is used in a look-up.
-    // We keep it alive in the lookup scenario, even when the VM didn't ask us too
+    // We keep it alive in the lookup scenario, even when the VM didn't ask us to,
     // because collectible types need the generics context when gc-ing.
-    if ((info.compMethodInfo->options & CORINFO_GENERICS_CTXT_FROM_THIS) &&
-        (lvaGenericsContextUsed || (info.compMethodInfo->options & CORINFO_GENERICS_CTXT_KEEP_ALIVE)))
+    if (genericsContextIsThis)
     {
-        return true;
+        const bool isUsed   = lvaGenericsContextUseCount > 0;
+        const bool mustKeep = (info.compMethodInfo->options & CORINFO_GENERICS_CTXT_KEEP_ALIVE) != 0;
+
+        if (isUsed || mustKeep)
+        {
+            JITDUMP("Reporting this as generic context: %u refs%s\n", lvaGenericsContextUseCount,
+                    mustKeep ? ", must keep" : "");
+
+            return true;
+        }
     }
 #endif
 
@@ -2185,7 +2264,7 @@ inline bool Compiler::lvaReportParamTypeArg()
 
         // Otherwise, if an exact type parameter is needed in the body, report the generics context.
         // We do this because collectible types needs the generics context when gc-ing.
-        if (lvaGenericsContextUsed)
+        if (lvaGenericsContextUseCount > 0)
         {
             return true;
         }
@@ -2812,9 +2891,7 @@ inline bool Compiler::fgIsThrowHlpBlk(BasicBlock* block)
 
     if (!((call->gtCall.gtCallMethHnd == eeFindHelper(CORINFO_HELP_RNGCHKFAIL)) ||
           (call->gtCall.gtCallMethHnd == eeFindHelper(CORINFO_HELP_THROWDIVZERO)) ||
-#if COR_JIT_EE_VERSION > 460
           (call->gtCall.gtCallMethHnd == eeFindHelper(CORINFO_HELP_THROWNULLREF)) ||
-#endif // COR_JIT_EE_VERSION
           (call->gtCall.gtCallMethHnd == eeFindHelper(CORINFO_HELP_OVERFLOW))))
     {
         return false;
@@ -2828,11 +2905,8 @@ inline bool Compiler::fgIsThrowHlpBlk(BasicBlock* block)
     {
         if (block == add->acdDstBlk)
         {
-            return add->acdKind == SCK_RNGCHK_FAIL || add->acdKind == SCK_DIV_BY_ZERO || add->acdKind == SCK_OVERFLOW
-#if COR_JIT_EE_VERSION > 460
-                   || add->acdKind == SCK_ARG_EXCPN || add->acdKind == SCK_ARG_RNG_EXCPN
-#endif // COR_JIT_EE_VERSION
-                ;
+            return add->acdKind == SCK_RNGCHK_FAIL || add->acdKind == SCK_DIV_BY_ZERO || add->acdKind == SCK_OVERFLOW ||
+                   add->acdKind == SCK_ARG_EXCPN || add->acdKind == SCK_ARG_RNG_EXCPN;
         }
     }
 
@@ -2854,11 +2928,8 @@ inline unsigned Compiler::fgThrowHlpBlkStkLevel(BasicBlock* block)
         {
             // Compute assert cond separately as assert macro cannot have conditional compilation directives.
             bool cond =
-                (add->acdKind == SCK_RNGCHK_FAIL || add->acdKind == SCK_DIV_BY_ZERO || add->acdKind == SCK_OVERFLOW
-#if COR_JIT_EE_VERSION > 460
-                 || add->acdKind == SCK_ARG_EXCPN || add->acdKind == SCK_ARG_RNG_EXCPN
-#endif // COR_JIT_EE_VERSION
-                 );
+                (add->acdKind == SCK_RNGCHK_FAIL || add->acdKind == SCK_DIV_BY_ZERO || add->acdKind == SCK_OVERFLOW ||
+                 add->acdKind == SCK_ARG_EXCPN || add->acdKind == SCK_ARG_RNG_EXCPN);
             assert(cond);
 
             // TODO: bbTgtStkDepth is DEBUG-only.
@@ -3927,7 +3998,7 @@ inline bool Compiler::IsSharedStaticHelper(GenTreePtr tree)
         helper == CORINFO_HELP_GETSHARED_GCTHREADSTATIC_BASE_DYNAMICCLASS ||
         helper == CORINFO_HELP_GETSHARED_NONGCTHREADSTATIC_BASE_DYNAMICCLASS ||
 #ifdef FEATURE_READYTORUN_COMPILER
-        helper == CORINFO_HELP_READYTORUN_STATIC_BASE ||
+        helper == CORINFO_HELP_READYTORUN_STATIC_BASE || helper == CORINFO_HELP_READYTORUN_GENERIC_STATIC_BASE ||
 #endif
         helper == CORINFO_HELP_CLASSINIT_SHARED_DYNAMICCLASS;
 #if 0
@@ -4105,16 +4176,12 @@ inline bool Compiler::compIsProfilerHookNeeded()
 {
 #ifdef PROFILING_SUPPORTED
     return compProfilerHookNeeded
-
-#if defined(_TARGET_ARM_) || defined(_TARGET_AMD64_)
            // IL stubs are excluded by VM and we need to do the same even running
            // under a complus env hook to generate profiler hooks
-           || (opts.compJitELTHookEnabled && !(opts.eeFlags & CORJIT_FLG_IL_STUB))
-#endif
-        ;
-#else // PROFILING_SUPPORTED
+           || (opts.compJitELTHookEnabled && !opts.jitFlags->IsSet(JitFlags::JIT_FLAG_IL_STUB));
+#else  // !PROFILING_SUPPORTED
     return false;
-#endif
+#endif // !PROFILING_SUPPORTED
 }
 
 /*****************************************************************************
@@ -4203,7 +4270,7 @@ inline bool Compiler::impIsDUP_LDVIRTFTN_TOKEN(const BYTE* delegateCreateStart, 
 
 inline bool Compiler::compIsForImportOnly()
 {
-    return ((opts.eeFlags & CORJIT_FLG_IMPORT_ONLY) != 0);
+    return opts.jitFlags->IsSet(JitFlags::JIT_FLAG_IMPORT_ONLY);
 }
 
 /*****************************************************************************
@@ -4370,10 +4437,12 @@ inline bool Compiler::lvaIsGCTracked(const LclVarDsc* varDsc)
 {
     if (varDsc->lvTracked && (varDsc->lvType == TYP_REF || varDsc->lvType == TYP_BYREF))
     {
+        // Stack parameters are always untracked w.r.t. GC reportings
+        const bool isStackParam = varDsc->lvIsParam && !varDsc->lvIsRegArg;
 #ifdef _TARGET_AMD64_
-        return !lvaIsFieldOfDependentlyPromotedStruct(varDsc);
+        return !isStackParam && !lvaIsFieldOfDependentlyPromotedStruct(varDsc);
 #else  // !_TARGET_AMD64_
-        return true;
+        return !isStackParam;
 #endif // !_TARGET_AMD64_
     }
     else
@@ -4387,7 +4456,7 @@ inline void Compiler::EndPhase(Phases phase)
 #if defined(FEATURE_JIT_METHOD_PERF)
     if (pCompJitTimer != nullptr)
     {
-        pCompJitTimer->EndPhase(phase);
+        pCompJitTimer->EndPhase(this, phase);
     }
 #endif
 #if DUMP_FLOWGRAPHS
@@ -4620,15 +4689,14 @@ inline void BasicBlock::InitVarSets(Compiler* comp)
 {
     VarSetOps::AssignNoCopy(comp, bbVarUse, VarSetOps::MakeEmpty(comp));
     VarSetOps::AssignNoCopy(comp, bbVarDef, VarSetOps::MakeEmpty(comp));
-    VarSetOps::AssignNoCopy(comp, bbVarTmp, VarSetOps::MakeEmpty(comp));
     VarSetOps::AssignNoCopy(comp, bbLiveIn, VarSetOps::MakeEmpty(comp));
     VarSetOps::AssignNoCopy(comp, bbLiveOut, VarSetOps::MakeEmpty(comp));
     VarSetOps::AssignNoCopy(comp, bbScope, VarSetOps::MakeEmpty(comp));
 
-    bbHeapUse     = false;
-    bbHeapDef     = false;
-    bbHeapLiveIn  = false;
-    bbHeapLiveOut = false;
+    bbMemoryUse     = emptyMemoryKindSet;
+    bbMemoryDef     = emptyMemoryKindSet;
+    bbMemoryLiveIn  = emptyMemoryKindSet;
+    bbMemoryLiveOut = emptyMemoryKindSet;
 }
 
 // Returns true if the basic block ends with GT_JMP

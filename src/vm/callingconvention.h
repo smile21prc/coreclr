@@ -1341,11 +1341,15 @@ void ArgIteratorTemplate<ARGITERATOR_BASE>::ComputeReturnFlags()
         break;
 
     case ELEMENT_TYPE_R4:
+#ifndef ARM_SOFTFP
         flags |= sizeof(float) << RETURN_FP_SIZE_SHIFT;
+#endif
         break;
 
     case ELEMENT_TYPE_R8:
+#ifndef ARM_SOFTFP
         flags |= sizeof(double) << RETURN_FP_SIZE_SHIFT;
+#endif
         break;
 
     case ELEMENT_TYPE_VALUETYPE:
@@ -1696,6 +1700,17 @@ inline BOOL HasRetBuffArg(MetaSig * pSig)
     ArgIterator argit(pSig);
     return argit.HasRetBuffArg();
 }
+
+#ifdef UNIX_X86_ABI
+// For UNIX_X86_ABI and unmanaged function, we always need RetBuf if the return type is VALUETYPE
+inline BOOL HasRetBuffArgUnmanagedFixup(MetaSig * pSig)
+{
+    WRAPPER_NO_CONTRACT;
+    // We cannot just pSig->GetReturnType() here since it will return ELEMENT_TYPE_VALUETYPE for enums
+    CorElementType type = pSig->GetRetTypeHandleThrowing().GetVerifierCorElementType();
+    return type == ELEMENT_TYPE_VALUETYPE;
+}
+#endif
 
 inline BOOL IsRetBuffPassedAsFirstArg()
 {

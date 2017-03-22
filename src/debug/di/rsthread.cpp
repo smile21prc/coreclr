@@ -1493,7 +1493,7 @@ void CordbThread::Get32bitFPRegisters(CONTEXT * pContext)
 
     for (i = 0; i <= floatStackTop; i++)
     {
-        long double td;
+        double td = 0.0;
         __asm fstp td // copy out the double
         m_floatValues[i] = td;
     }
@@ -4585,7 +4585,7 @@ void CordbUnmanagedThread::SaveRaiseExceptionEntryContext()
         LOG((LF_CORDB, LL_INFO1000, "CP::SREEC: failed to read exception information pointer.\n"));
         return;
     }
-#elif
+#else
     _ASSERTE(!"Implement this for your platform");
     return;
 #endif
@@ -5849,11 +5849,11 @@ CordbMiscFrame::CordbMiscFrame()
 // the real constructor which stores the funclet-related information in the CordbMiscFrame
 CordbMiscFrame::CordbMiscFrame(DebuggerIPCE_JITFuncData * pJITFuncData)
 {
-#if defined(DBG_TARGET_WIN64) || defined(DBG_TARGET_ARM)
+#ifdef WIN64EXCEPTIONS
     this->parentIP       = pJITFuncData->parentNativeOffset;
     this->fpParentOrSelf = pJITFuncData->fpParentOrSelf;
     this->fIsFilterFunclet = (pJITFuncData->fIsFilterFrame == TRUE);
-#endif // DBG_TARGET_WIN64 || DBG_TARGET_ARM
+#endif // WIN64EXCEPTIONS
 }
 
 /* ------------------------------------------------------------------------- *
@@ -8935,8 +8935,13 @@ HRESULT CordbJITILFrame::GetReturnValueForILOffsetImpl(ULONG32 ILoffset, ICorDeb
     bool found = false;
     ULONG32 currentOffset = m_nativeFrame->GetIPOffset();
     for (ULONG32 i = 0; i < count; ++i)
-        if ((found = currentOffset == offsets[i]))
+    {
+        if (currentOffset == offsets[i])
+        {
+            found = true;
             break;
+        }
+    }
 
     if (!found)
         return E_UNEXPECTED;

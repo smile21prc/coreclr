@@ -100,7 +100,7 @@ namespace System.Diagnostics.Tracing
         {
             if (eventSourceName == null)
             {
-                throw new ArgumentNullException("eventSourceName");
+                throw new ArgumentNullException(nameof(eventSourceName));
             }
             Contract.EndContractBlock();
         }
@@ -110,12 +110,11 @@ namespace System.Diagnostics.Tracing
         /// (Native API: EventWriteTransfer)
         /// </summary>
         /// <param name="eventName">The name of the event. Must not be null.</param>
-        [SecuritySafeCritical]
         public unsafe void Write(string eventName)
         {
             if (eventName == null)
             {
-                throw new ArgumentNullException("eventName");
+                throw new ArgumentNullException(nameof(eventName));
             }
 
             Contract.EndContractBlock();
@@ -138,12 +137,11 @@ namespace System.Diagnostics.Tracing
         /// Options for the event, such as the level, keywords, and opcode. Unset
         /// options will be set to default values.
         /// </param>
-        [SecuritySafeCritical]
         public unsafe void Write(string eventName, EventSourceOptions options)
         {
             if (eventName == null)
             {
-                throw new ArgumentNullException("eventName");
+                throw new ArgumentNullException(nameof(eventName));
             }
 
             Contract.EndContractBlock();
@@ -175,7 +173,6 @@ namespace System.Diagnostics.Tracing
         /// public instance properties of data will be written recursively to
         /// create the fields of the event.
         /// </param>
-        [SecuritySafeCritical]
         public unsafe void Write<T>(
             string eventName,
             T data)
@@ -212,7 +209,6 @@ namespace System.Diagnostics.Tracing
         /// public instance properties of data will be written recursively to
         /// create the fields of the event.
         /// </param>
-        [SecuritySafeCritical]
         public unsafe void Write<T>(
             string eventName,
             EventSourceOptions options,
@@ -251,7 +247,6 @@ namespace System.Diagnostics.Tracing
         /// public instance properties of data will be written recursively to
         /// create the fields of the event.
         /// </param>
-        [SecuritySafeCritical]
         public unsafe void Write<T>(
             string eventName,
             ref EventSourceOptions options,
@@ -297,7 +292,6 @@ namespace System.Diagnostics.Tracing
         /// public instance properties of data will be written recursively to
         /// create the fields of the event.
         /// </param>
-        [SecuritySafeCritical]
         public unsafe void Write<T>(
             string eventName,
             ref EventSourceOptions options,
@@ -354,7 +348,6 @@ namespace System.Diagnostics.Tracing
         /// the values must match the number and types of the fields described by the
         /// eventTypes parameter.
         /// </param>
-        [SecuritySafeCritical]
         private unsafe void WriteMultiMerge(
             string eventName,
             ref EventSourceOptions options,
@@ -415,7 +408,6 @@ namespace System.Diagnostics.Tracing
         /// the values must match the number and types of the fields described by the
         /// eventTypes parameter.
         /// </param>
-        [SecuritySafeCritical]
         private unsafe void WriteMultiMergeInner(
             string eventName,
             ref EventSourceOptions options,
@@ -453,11 +445,11 @@ namespace System.Diagnostics.Tracing
             var pins = stackalloc GCHandle[pinCount];
 
             fixed (byte*
-                pMetadata0 = this.providerMetadata,
+                pMetadata0 = providerMetadata,
                 pMetadata1 = nameInfo.nameMetadata,
                 pMetadata2 = eventTypes.typeMetadata)
             {
-                descriptors[0].SetMetadata(pMetadata0, this.providerMetadata.Length, 2);
+                descriptors[0].SetMetadata(pMetadata0, providerMetadata.Length, 2);
                 descriptors[1].SetMetadata(pMetadata1, nameInfo.nameMetadata.Length, 1);
                 descriptors[2].SetMetadata(pMetadata2, eventTypes.typeMetadata.Length, 1);
 
@@ -526,7 +518,6 @@ namespace System.Diagnostics.Tracing
         /// The number and types of the values must match the number and types of the 
         /// fields described by the eventTypes parameter.
         /// </param>
-        [SecuritySafeCritical]
         internal unsafe void WriteMultiMerge(
             string eventName,
             ref EventSourceOptions options,
@@ -555,11 +546,11 @@ namespace System.Diagnostics.Tracing
                 var descriptors = stackalloc EventData[eventTypes.dataCount + eventTypes.typeInfos.Length * 2 + 3];
 
                 fixed (byte*
-                    pMetadata0 = this.providerMetadata,
+                    pMetadata0 = providerMetadata,
                     pMetadata1 = nameInfo.nameMetadata,
                     pMetadata2 = eventTypes.typeMetadata)
                 {
-                    descriptors[0].SetMetadata(pMetadata0, this.providerMetadata.Length, 2);
+                    descriptors[0].SetMetadata(pMetadata0, providerMetadata.Length, 2);
                     descriptors[1].SetMetadata(pMetadata1, nameInfo.nameMetadata.Length, 1);
                     descriptors[2].SetMetadata(pMetadata2, eventTypes.typeMetadata.Length, 1);
                     int numDescrs = 3;
@@ -604,7 +595,6 @@ namespace System.Diagnostics.Tracing
 #endif // FEATURE_MANAGED_ETW
         }
 
-        [SecuritySafeCritical]
         private unsafe void WriteImpl(
             string eventName,
             ref EventSourceOptions options,
@@ -632,11 +622,11 @@ namespace System.Diagnostics.Tracing
                     var pins = stackalloc GCHandle[pinCount];
 
                     fixed (byte*
-                        pMetadata0 = this.providerMetadata,
+                        pMetadata0 = providerMetadata,
                         pMetadata1 = nameInfo.nameMetadata,
                         pMetadata2 = eventTypes.typeMetadata)
                     {
-                        descriptors[0].SetMetadata(pMetadata0, this.providerMetadata.Length, 2);
+                        descriptors[0].SetMetadata(pMetadata0, providerMetadata.Length, 2);
                         descriptors[1].SetMetadata(pMetadata1, nameInfo.nameMetadata.Length, 1);
                         descriptors[2].SetMetadata(pMetadata2, eventTypes.typeMetadata.Length, 1);
 #endif // FEATURE_MANAGED_ETW
@@ -694,7 +684,6 @@ namespace System.Diagnostics.Tracing
                                 var eventData = (EventPayload)(eventTypes.typeInfos[0].GetData(data));
                                 WriteToAllListeners(eventName, ref descriptor, nameInfo.tags, pActivityId, eventData);
                             }
-
                         }
                         catch (Exception ex)
                         {
@@ -721,14 +710,13 @@ namespace System.Diagnostics.Tracing
             }
         }
 
-        [SecurityCritical]
         private unsafe void WriteToAllListeners(string eventName, ref EventDescriptor eventDescriptor, EventTags tags, Guid* pActivityId, EventPayload payload)
         {
             EventWrittenEventArgs eventCallbackArgs = new EventWrittenEventArgs(this);
             eventCallbackArgs.EventName = eventName;
-            eventCallbackArgs.m_level = (EventLevel) eventDescriptor.Level;
-            eventCallbackArgs.m_keywords = (EventKeywords) eventDescriptor.Keywords;
-            eventCallbackArgs.m_opcode = (EventOpcode) eventDescriptor.Opcode;
+            eventCallbackArgs.m_level = (EventLevel)eventDescriptor.Level;
+            eventCallbackArgs.m_keywords = (EventKeywords)eventDescriptor.Keywords;
+            eventCallbackArgs.m_opcode = (EventOpcode)eventDescriptor.Opcode;
             eventCallbackArgs.m_tags = tags;
 
             // Self described events do not have an id attached. We mark it internally with -1.
@@ -750,7 +738,6 @@ namespace System.Diagnostics.Tracing
             System.Runtime.ConstrainedExecution.Consistency.WillNotCorruptState,
             System.Runtime.ConstrainedExecution.Cer.Success)]
 #endif
-        [SecurityCritical]
         [NonEvent]
         private unsafe void WriteCleanup(GCHandle* pPins, int cPins)
         {
@@ -864,7 +851,7 @@ namespace System.Diagnostics.Tracing
             {
                 return (c - 'A' + 10);
             }
-            
+
             throw new ArgumentException(Resources.GetResourceString("BadHexDigit", c), "traits");
         }
 
